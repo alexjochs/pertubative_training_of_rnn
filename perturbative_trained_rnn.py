@@ -28,6 +28,12 @@ import torchvision
 from torchvision import transforms
 
 
+
+def log_debug(msg):
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"[DEBUG] {msg}", flush=True)
+
 @dataclass
 class ReservoirConfig:
     N: int = 2000          # Reservoir size
@@ -302,6 +308,11 @@ def precompute_embeddings(args, dev0):
 
 
 def main() -> None:
+    # Force synchronous CUDA execution for debugging
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+    # Disable cuDNN benchmarking to prevent hangs during algorithm search
+    torch.backends.cudnn.benchmark = False
+    
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", type=str, default="./data")
     ap.add_argument("--gpus", type=int, default=1, help="Ignored in single process mode, kept for compat")
@@ -373,20 +384,23 @@ def main() -> None:
     res0 = Reservoir(cfg0, device=dev0).to(dev0)
     res0.eval()
 
+    # Create a reusable generator to avoid overhead/potential issues
+    batch_gen = torch.Generator(device=dev0)
+
     def get_batch(seed: int, batch_size: int) -> torch.Tensor:
-        g = torch.Generator(device=dev0)
-        g.manual_seed(seed)
-        indices = torch.randint(0, dataset_len, (batch_size,), generator=g, device=dev0)
+        batch_gen.manual_seed(seed)
+        indices = torch.randint(0, dataset_len, (batch_size,), generator=batch_gen, device=dev0)
         return dataset_z[indices] # [B, T, D]
 
     def train_decoder_on_batch(seed: int, z_batch: torch.Tensor) -> float:
         # z_batch: [B, T, D]
-        # print("    [train_decoder] Start...", flush=True)
+        log_debug(f"train_decoder_on_batch: Start. z_batch shape: {z_batch.shape}")
         B, T, _ = z_batch.shape
         res0.set_adapter_from_theta(theta)
 
         decoder.train()
-        for _ in range(args.dec_steps):
+        for step_i in range(args.dec_steps):
+            log_debug(f"train_decoder_on_batch: Step {step_i}/{args.dec_steps}")
             dec_opt.zero_grad(set_to_none=True)
             h = torch.zeros((B, N), device=dev0)
             loss_steps = []
@@ -394,17 +408,22 @@ def main() -> None:
             # Use teacher forcing for decoder training or rollout?
             # Usually teacher forcing is better for training the readout
             for t in range(T - 1):
+                # log_debug(f"train_decoder_on_batch: Loop t={t}")
                 zt = z_batch[:, t]
                 with torch.no_grad():
                     h = res0.step(h, zt)
                 pred = decoder(h)
                 loss_steps.append(F.mse_loss(pred, z_batch[:, t + 1], reduction="mean"))
             
+            log_debug("train_decoder_on_batch: stacking loss")
             loss = torch.stack(loss_steps).mean()
+            log_debug("train_decoder_on_batch: backward")
             loss.backward()
+            log_debug("train_decoder_on_batch: optimizer step")
             dec_opt.step()
 
         decoder.eval()
+        log_debug("train_decoder_on_batch: Finished")
         return float(loss.detach().cpu().item())
 
     # 3. ES Loop
@@ -420,16 +439,20 @@ def main() -> None:
             
         # A. Get Batch for this iteration
         # We use the same batch for base and all candidates to reduce variance
+        log_debug("Main: Getting batch...")
         z_batch = get_batch(seed_it, args.batch)
 
         # B. Train Decoder / Get Base Loss
         # print("  [Main] Training decoder...", flush=True)
+        log_debug("Main: Training decoder...")
         base_loss = train_decoder_on_batch(seed_it, z_batch)
         # print(f"  [Main] Base loss: {base_loss:.4f}", flush=True)
+        log_debug(f"Main: Base loss: {base_loss:.4f}")
 
         # C. Sample Antithetic Pairs
         K = args.pairs
         # Generate noise directly on GPU
+        log_debug("Main: Generating noise...")
         eps = torch.randn((K, theta_dim), device=dev0, dtype=torch.float32)
         
         candidates = []
@@ -437,6 +460,8 @@ def main() -> None:
             for k in range(K):
                 cand = theta + sign * args.sigma * eps[k]
                 candidates.append(cand)
+        
+        log_debug(f"Main: {len(candidates)} candidates generated.")
         
         # D. Evaluate Candidates
         # Sequential evaluation on GPU is fast enough because of pre-computation
@@ -455,11 +480,15 @@ def main() -> None:
             cand_losses.append(loss)
             # if i % 10 == 0:
             #    print(f"    [Main] Cand {i}/{len(candidates)} evaluated.", flush=True)
+            if i % 10 == 0:
+                 log_debug(f"    [Main] Cand {i}/{len(candidates)} evaluated.")
         
         # print("  [Main] Candidates evaluated.", flush=True)
         cand_losses = torch.stack(cand_losses)
+        log_debug(f"Main: Candidates stacked. Shape: {cand_losses.shape}")
         
         # E. Update Theta
+        log_debug("Main: Update Theta")
         # Reconstruct pairs
         losses_pos = cand_losses[:K]
         losses_neg = cand_losses[K:]
@@ -486,6 +515,7 @@ def main() -> None:
         
         theta_opt.step()
         theta_opt.zero_grad()
+        log_debug("Main: Iteration complete")
         
         # Logging
         if it % args.log_every == 0:
