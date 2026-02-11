@@ -546,9 +546,12 @@ def main() -> None:
         return torch.randint(0, dataset_len, (batch_size,), generator=g)
 
     def train_decoder_on_batch(seed: int) -> float:
+        print("  [Master] train_decoder_on_batch: fetching indices...", flush=True)
         indices = get_batch_indices(seed, args.batch)
+        print(f"  [Master] train_decoder_on_batch: loading batch (B={args.batch})...", flush=True)
         batch_list = [mm0[i] for i in indices]
-        frames = torch.stack(batch_list).to(dev0, non_blocking=True) 
+        frames = torch.stack(batch_list).to(dev0, non_blocking=True)
+        print("  [Master] train_decoder_on_batch: batch to device.", flush=True) 
         
         if args.T < frames.shape[1]:
             frames = frames[:, :args.T]
@@ -560,6 +563,7 @@ def main() -> None:
 
         res0.set_adapter_from_theta(theta)
 
+        print(f"  [Master] train_decoder_on_batch: training decoder ({args.dec_steps} steps)...", flush=True)
         decoder.train()
         for _ in range(args.dec_steps):
             dec_opt.zero_grad(set_to_none=True)
@@ -578,6 +582,7 @@ def main() -> None:
             dec_opt.step()
 
         decoder.eval()
+        print("  [Master] train_decoder_on_batch: done.", flush=True)
         return float(loss.detach().cpu().item())
 
     # ES loop
@@ -587,6 +592,7 @@ def main() -> None:
 
     try:
         for it in range(1, args.iters + 1):
+            print(f"Main: Starting iter {it}...", flush=True)
             seed_it = base_seed + it
 
             # 1) Train decoder on unperturbed theta
