@@ -546,6 +546,10 @@ def main() -> None:
         # epsilon is [args.pairs, theta_dim].
         # theta is [theta_dim].
         
+        K = args.pairs
+        # Generate noise directly on GPU [Pairs, ThetaDim]
+        epsilon = torch.randn((K, theta_dim), device=device, dtype=torch.float32)
+        
         # Pos candidates: theta + sigma * epsilon
         theta_unsqueezed = theta.unsqueeze(0)
         pop_pos = theta_unsqueezed + args.sigma * epsilon
