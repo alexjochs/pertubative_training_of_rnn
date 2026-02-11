@@ -83,7 +83,7 @@ python3 perturbative_trained_rnn.py \
     --gpus 1 \
     --iters 5000 \
     --pairs 4096 \
-    --batch 512 \
+    --batch 128 \
     --hidden 4096 \
     --log_every 50 \
     --warmup 15 \

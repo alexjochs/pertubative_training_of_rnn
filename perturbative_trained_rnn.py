@@ -578,15 +578,18 @@ def main() -> None:
         try:
             cand_losses = reservoir.batched_rollout_loss(z_batch, decoder, args.warmup, cand_U, cand_V)
         except torch.cuda.OutOfMemoryError:
-            print("WARNING: OOM with full batch. Switching to chunked evaluation.", flush=True)
-            # Fallback to chunks of 1024
-            chunk_size = 1024
+            print("WARNING: OOM with full batch. Cleaning up and switching to chunked evaluation.", flush=True)
+            torch.cuda.empty_cache()
+            # Fallback to smaller chunks
+            chunk_size = 512
             loss_chunks = []
             for i in range(0, len(pop_theta), chunk_size):
                 u_chunk = cand_U[i : i + chunk_size]
                 v_chunk = cand_V[i : i + chunk_size]
                 l_chunk = reservoir.batched_rollout_loss(z_batch, decoder, args.warmup, u_chunk, v_chunk)
                 loss_chunks.append(l_chunk)
+                # Should we empty cache here too? Maybe overkill but safe.
+                # torch.cuda.empty_cache()
             cand_losses = torch.cat(loss_chunks)
 
         
