@@ -194,34 +194,30 @@ class Reservoir(nn.Module):
         # Initial state h: [K, B, N]
         h = torch.zeros((K, B, N), device=self.device, dtype=torch.float32)
         
-        losses = []
-        z_in = z_seq[:, 0] # [B, D] - shared across K
-        
         # Memory Optimization:
-        # We perform operations in-place on 'pre' to avoid allocating multiple [K, B, N] buffers.
-        # Peak memory is dominated by: h, pre, nh (3 * K*B*N) instead of 5-6 * K*B*N.
+        # Pre-allocate buffer for activations to avoid creating new [K, B, N] tensors (32GB) per step.
+        pre_buffer = torch.empty((K, B, N), device=self.device, dtype=torch.float32)
         
         for t in range(T - 1):
             # 1. Initialize pre-activation with Input term
-            # z_in is [B, D] (shared) or [K, B, D]
-            
             if z_in.dim() == 2:
                 # Shared input [B, D] -> [B, N]
                 inp_small = z_in @ self.Win.t()
-                # Expand to [K, B, N] and clone to create the 'pre' buffer
-                pre = inp_small.unsqueeze(0).expand(K, B, N).clone()
+                # Expand and copy to buffer (Broadcasting)
+                pre_buffer.copy_(inp_small.unsqueeze(0))
             else:
-                # Individual input [K, B, D] -> [KB, N] -> [K, B, N]
-                pre = (z_in.view(K * B, D) @ self.Win.t()).view(K, B, N)
+                # Individual input [K, B, D] -> [KB, N]
+                # Direct MM into buffer view
+                z_in_flat = z_in.view(K * B, D)
+                torch.mm(z_in_flat, self.Win.t(), out=pre_buffer.view(K * B, N))
             
             # 2. Add Bias
-            pre.add_(self.b)
+            pre_buffer.add_(self.b)
             
             # 3. Add Recurrent Base: h @ W0.t()
             # W0 is dense. h is [K, B, N].
-            # We use addmm_ on flattened views: [KB, N] + [KB, N] @ [N, N]
             h_flat = h.view(K * B, N)
-            pre_flat = pre.view(K * B, N)
+            pre_flat = pre_buffer.view(K * B, N)
             pre_flat.addmm_(h_flat, self.W0.t())
             
             # 4. Add Low-Rank Adapter: (h @ V) @ U.t()
@@ -229,9 +225,7 @@ class Reservoir(nn.Module):
             low_temp = torch.bmm(h, cand_V)
             
             # pre += low_temp @ U.t()
-            # cand_U is [K, N, R]. Transpose to [K, R, N].
-            # baddbmm_ -> pre + alpha * (low_temp @ cand_U.t())
-            pre.baddbmm_(low_temp, cand_U.transpose(1, 2))
+            pre_buffer.baddbmm_(low_temp, cand_U.transpose(1, 2))
             
             # DEBUG: Memory check at t=0
             if t == 0:
@@ -239,13 +233,14 @@ class Reservoir(nn.Module):
                  mem_gb = torch.cuda.memory_allocated() / 1e9
                  print(f"DEBUG[t=0]: Memory Optimized: {mem_gb:.2f} GB", flush=True)
 
-            # 5. Activation
-            nh = torch.tanh(pre)
+            # 5. Activation (In-place)
+            # pre_buffer becomes 'nh'
+            pre_buffer.tanh_()
             
             # 6. Update h in-place
             # h = (1 - leak) * h + leak * nh
             h.mul_(1.0 - self.cfg.leak)
-            h.add_(nh, alpha=self.cfg.leak)
+            h.add_(pre_buffer, alpha=self.cfg.leak)
             
             # Decode
             # Decoder is shared. h: [K, B, N]
@@ -556,6 +551,9 @@ def main() -> None:
         pop_neg = theta_unsqueezed - args.sigma * epsilon
         
         pop_theta = torch.cat([pop_pos, pop_neg], dim=0) # [K, theta_dim] where K = 2*pairs
+        
+        # Free memory of intermediate tensors
+        del pop_pos, pop_neg
         
         # Reshape into U and V
         # theta structure: [U_flat, V_flat]
