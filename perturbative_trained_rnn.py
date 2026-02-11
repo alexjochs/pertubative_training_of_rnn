@@ -276,6 +276,15 @@ class Reservoir(nn.Module):
 
 
 
+
+def make_decoder(N: int, D: int, device: torch.device) -> nn.Linear:
+    decoder = nn.Linear(N, D, bias=True).to(device)
+    # Using Xavier init
+    nn.init.xavier_normal_(decoder.weight)
+    nn.init.zeros_(decoder.bias)
+    return decoder
+
+
 def rank_transform(raw_losses: torch.Tensor) -> torch.Tensor:
     M = len(raw_losses)
     ranks = torch.empty_like(raw_losses)
