@@ -123,6 +123,8 @@ class Reservoir(nn.Module):
         Fixed in-degree approximation of Erdos–Renyi:
         For each row i, choose k_in random cols.
         """
+        print(f"  [Reservoir] Generating sparse W0 ({N}x{N})...", flush=True)
+        t0 = time.time()
         g = torch.Generator(device="cpu")
         g.manual_seed(1234)
 
@@ -145,6 +147,8 @@ class Reservoir(nn.Module):
         idx = torch.stack([row, col], dim=0)
         W0 = torch.sparse_coo_tensor(idx, val, (N, N), device=device)
         W0 = W0.coalesce()
+        dt = time.time() - t0
+        print(f"  [Reservoir] W0 generated in {dt:.2f}s.", flush=True)
         return W0
 
     def set_adapter_from_theta(self, theta: torch.Tensor) -> None:
@@ -249,6 +253,7 @@ class WorkerJob:
 
 
 def worker_main(rank: int, args: argparse.Namespace, inq: mp.Queue, outq: mp.Queue) -> None:
+    print(f"[Worker {rank}] Starting...", flush=True)
     # Handle CPU-only case
     if args.gpus == 0:
         device = torch.device("cpu")
@@ -269,6 +274,7 @@ def worker_main(rank: int, args: argparse.Namespace, inq: mp.Queue, outq: mp.Que
         download=True,
         transform=transform
     )
+    print(f"[Worker {rank}] Dataset loaded.", flush=True)
 
     enc = PretrainedResNet18Encoder(emb_dim=args.emb_dim).to(device)
     enc.eval()
@@ -287,6 +293,7 @@ def worker_main(rank: int, args: argparse.Namespace, inq: mp.Queue, outq: mp.Que
     )
     res = Reservoir(cfg, device=device).to(device)
     res.eval()
+    print(f"[Worker {rank}] Models initialized.", flush=True)
 
     # Decoder lives in worker only for scoring (weights copied from master per job)
     decoder = nn.Linear(cfg.N, cfg.D, bias=True).to(device)
@@ -294,6 +301,7 @@ def worker_main(rank: int, args: argparse.Namespace, inq: mp.Queue, outq: mp.Que
     for p in decoder.parameters():
         p.requires_grad_(False)
 
+    print(f"[Worker {rank}] Waiting for job...", flush=True)
     while True:
         job = inq.get()
         if job is None:
@@ -492,6 +500,7 @@ def main() -> None:
     print(f"Dataset loaded. Size: {dataset_len}")
 
     # Workers
+    print("Main: Spawning workers...", flush=True)
     ctx = mp.get_context("spawn")
     inqs: List[mp.Queue] = [ctx.Queue(maxsize=8) for _ in range(max(1, args.gpus))]
     outqs: List[mp.Queue] = [ctx.Queue(maxsize=8) for _ in range(max(1, args.gpus))]
@@ -505,6 +514,7 @@ def main() -> None:
         p.daemon = True
         p.start()
         procs.append(p)
+    print("Main: Workers spawned.", flush=True)
 
     # Master components
     N, D, rnk = args.hidden, args.emb_dim, args.rank
@@ -528,6 +538,7 @@ def main() -> None:
     )
     res0 = Reservoir(cfg0, device=dev0).to(dev0)
     res0.eval()
+    print("Main: Master reservoir initialized.", flush=True)
 
     def get_batch_indices(seed: int, batch_size: int) -> torch.Tensor:
         g = torch.Generator()
@@ -571,6 +582,7 @@ def main() -> None:
 
     # ES loop
     base_seed = 10_000_000 + args.seed * 1_000_000
+    print("Main: Starting ES loop...", flush=True)
     t0 = time.time()
 
     try:
