@@ -7,7 +7,7 @@
 #SBATCH --nodelist=cn-x-1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=48
 #SBATCH --gres=gpu:1
 #SBATCH --mem=480G
 #SBATCH --time=12:00:00
@@ -82,10 +82,10 @@ export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
 python3 perturbative_trained_rnn.py \
     --gpus 1 \
     --iters 100 \
-    --pairs 100 \
-    --batch 256 \
-    --hidden 4000 \
-    --log_every 10 \
+    --pairs 10 \
+    --batch 10 \
+    --hidden 2000 \
+    --log_every 1 \
     --warmup 15 \
     --T 20 \
     --emb_dim 128 \
