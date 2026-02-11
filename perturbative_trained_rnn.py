@@ -29,11 +29,6 @@ from torchvision import transforms
 
 
 
-def log_debug(msg):
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    print(f"[DEBUG] {msg}", flush=True)
-
 @dataclass
 class ReservoirConfig:
     N: int = 2000          # Reservoir size
@@ -191,19 +186,13 @@ def make_decoder(N: int, D: int, device: torch.device) -> nn.Linear:
 
 
 def rank_transform(raw_losses: torch.Tensor) -> torch.Tensor:
-    log_debug("rank_transform: start")
     M = len(raw_losses)
     ranks = torch.empty_like(raw_losses)
-    log_debug("rank_transform: empty_like done")
     order = torch.argsort(raw_losses)
-    log_debug("rank_transform: argsort done")
     # FIX: Ensure arange is on the same device as ranks
     ranks[order] = torch.arange(M, dtype=torch.float32, device=raw_losses.device)
-    log_debug("rank_transform: arange assignment done")
     w = -(ranks / (M - 1) - 0.5)
-    log_debug("rank_transform: w calculation done")
     w = w - w.mean()
-    log_debug("rank_transform: return")
     return w
 
 
@@ -316,8 +305,6 @@ def precompute_embeddings(args, dev0):
 
 
 def main() -> None:
-    # Force synchronous CUDA execution for debugging
-    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     # Disable cuDNN benchmarking to prevent hangs during algorithm search
     torch.backends.cudnn.benchmark = False
     
@@ -402,13 +389,12 @@ def main() -> None:
 
     def train_decoder_on_batch(seed: int, z_batch: torch.Tensor) -> float:
         # z_batch: [B, T, D]
-        log_debug(f"train_decoder_on_batch: Start. z_batch shape: {z_batch.shape}")
+        # print("    [train_decoder] Start...", flush=True)
         B, T, _ = z_batch.shape
         res0.set_adapter_from_theta(theta)
 
         decoder.train()
-        for step_i in range(args.dec_steps):
-            log_debug(f"train_decoder_on_batch: Step {step_i}/{args.dec_steps}")
+        for _ in range(args.dec_steps):
             dec_opt.zero_grad(set_to_none=True)
             h = torch.zeros((B, N), device=dev0)
             loss_steps = []
@@ -416,22 +402,17 @@ def main() -> None:
             # Use teacher forcing for decoder training or rollout?
             # Usually teacher forcing is better for training the readout
             for t in range(T - 1):
-                # log_debug(f"train_decoder_on_batch: Loop t={t}")
                 zt = z_batch[:, t]
                 with torch.no_grad():
                     h = res0.step(h, zt)
                 pred = decoder(h)
                 loss_steps.append(F.mse_loss(pred, z_batch[:, t + 1], reduction="mean"))
             
-            log_debug("train_decoder_on_batch: stacking loss")
             loss = torch.stack(loss_steps).mean()
-            log_debug("train_decoder_on_batch: backward")
             loss.backward()
-            log_debug("train_decoder_on_batch: optimizer step")
             dec_opt.step()
 
         decoder.eval()
-        log_debug("train_decoder_on_batch: Finished")
         return float(loss.detach().cpu().item())
 
     # 3. ES Loop
@@ -447,20 +428,16 @@ def main() -> None:
             
         # A. Get Batch for this iteration
         # We use the same batch for base and all candidates to reduce variance
-        log_debug("Main: Getting batch...")
         z_batch = get_batch(seed_it, args.batch)
 
         # B. Train Decoder / Get Base Loss
         # print("  [Main] Training decoder...", flush=True)
-        log_debug("Main: Training decoder...")
         base_loss = train_decoder_on_batch(seed_it, z_batch)
         # print(f"  [Main] Base loss: {base_loss:.4f}", flush=True)
-        log_debug(f"Main: Base loss: {base_loss:.4f}")
 
         # C. Sample Antithetic Pairs
         K = args.pairs
         # Generate noise directly on GPU
-        log_debug("Main: Generating noise...")
         eps = torch.randn((K, theta_dim), device=dev0, dtype=torch.float32)
         
         candidates = []
@@ -468,8 +445,6 @@ def main() -> None:
             for k in range(K):
                 cand = theta + sign * args.sigma * eps[k]
                 candidates.append(cand)
-        
-        log_debug(f"Main: {len(candidates)} candidates generated.")
         
         # D. Evaluate Candidates
         # Sequential evaluation on GPU is fast enough because of pre-computation
@@ -488,23 +463,17 @@ def main() -> None:
             cand_losses.append(loss)
             # if i % 10 == 0:
             #    print(f"    [Main] Cand {i}/{len(candidates)} evaluated.", flush=True)
-            if i % 10 == 0:
-                 log_debug(f"    [Main] Cand {i}/{len(candidates)} evaluated.")
         
         # print("  [Main] Candidates evaluated.", flush=True)
         cand_losses = torch.stack(cand_losses)
-        log_debug(f"Main: Candidates stacked. Shape: {cand_losses.shape}")
         
         # E. Update Theta
-        log_debug("Main: Update Theta - Start")
         # Reconstruct pairs
         losses_pos = cand_losses[:K]
         losses_neg = cand_losses[K:]
-        log_debug("Main: Update Theta - Split losses_pos/neg")
         
         # Fitness shaping (using all losses together)
         w = rank_transform(cand_losses)
-        log_debug("Main: Update Theta - rank_transform complete")
         w_pos = w[:K]
         w_neg = w[K:]
         
@@ -514,25 +483,17 @@ def main() -> None:
         
         # eps corresponds to pos. -eps corresponds to neg.
         # grad ~ sum( w_pos[k] * eps[k] + w_neg[k] * (-eps[k]) )
-        log_debug("Main: Update Theta - grad_est calculation start")
-        # Ensure w_pos, w_neg are views or reshaped correctly, check devices? Should be OK.
-        log_debug(f"Main: w_pos shape: {w_pos.shape}, eps shape: {eps.shape}, device: {eps.device}")
-        
         grad_est = (w_pos.view(-1, 1) * eps - w_neg.view(-1, 1) * eps).mean(dim=0)
-        log_debug("Main: Update Theta - grad_est computed")
         # This simplifies to (w_pos - w_neg) * eps
         
         # Adam Step
         theta.grad = -grad_est # We want to minimize loss, so we move opposite to gradient of loss (which is ascent on fitness?)
-        log_debug("Main: Update Theta - assigned theta.grad")
         # Wait, rank transform: low loss -> high rank -> high weight. 
         # So we want to ASCEND the weighted average.
         # Adam minimizes. So we set grad = -grad_est.
         
         theta_opt.step()
-        log_debug("Main: Update Theta - optimizer step done")
         theta_opt.zero_grad()
-        log_debug("Main: Iteration complete")
         
         # Logging
         if it % args.log_every == 0:

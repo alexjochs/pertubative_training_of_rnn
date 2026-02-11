@@ -81,11 +81,11 @@ export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
 # Run training (match Slurm GPU request)
 python3 perturbative_trained_rnn.py \
     --gpus 1 \
-    --iters 100 \
-    --pairs 10 \
-    --batch 10 \
-    --hidden 2000 \
-    --log_every 1 \
+    --iters 5000 \
+    --pairs 512 \
+    --batch 512 \
+    --hidden 4096 \
+    --log_every 50 \
     --warmup 15 \
     --T 20 \
     --emb_dim 128 \
