@@ -197,6 +197,9 @@ class Reservoir(nn.Module):
         # Memory Optimization:
         # Pre-allocate buffer for activations to avoid creating new [K, B, N] tensors (32GB) per step.
         pre_buffer = torch.empty((K, B, N), device=self.device, dtype=torch.float32)
+
+        losses = []
+        z_in = z_seq[:, 0] # [B, D] - shared across K
         
         for t in range(T - 1):
             # 1. Initialize pre-activation with Input term
