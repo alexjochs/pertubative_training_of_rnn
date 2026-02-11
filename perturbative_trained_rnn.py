@@ -409,9 +409,8 @@ def main() -> None:
     args_parser.add_argument("--warmup", type=int, default=15, help="Warmup steps before tracking loss")
     args_parser.add_argument("--batch", type=int, default=16, help="Batch size for ES evaluation")
     
-    ap.add_argument("--iters", type=int, default=2000)
-    ap.add_argument("--pairs", type=int, default=32)
-    ap.add_argument("--sigma", type=float, default=0.1)
+
+
     args_parser.add_argument("--iters", type=int, default=2000, help="Total ES iterations")
     args_parser.add_argument("--pairs", type=int, default=32, help="Number of antithetic perturbation pairs per iter")
     args_parser.add_argument("--sigma", type=float, default=0.1, help="Perturbation standard deviation")
@@ -420,10 +419,11 @@ def main() -> None:
     args_parser.add_argument("--dec_lr", type=float, default=0.001, help="Learning rate for readout decoder")
     args_parser.add_argument("--dec_steps", type=int, default=1, help="Decoder training steps per ES iter")
 
-    ap.add_argument("--leak", type=float, default=0.1)
-    ap.add_argument("--h_clip", type=float, default=50.0)
-    ap.add_argument("--w0_std", type=float, default=1.0)
-    ap.add_argument("--win_std", type=float, default=0.2)
+    
+    args_parser.add_argument("--leak", type=float, default=0.1, help="Leak rate (alpha)")
+    args_parser.add_argument("--h_clip", type=float, default=50.0, help="Clip value for hidden state")
+    args_parser.add_argument("--w0_std", type=float, default=1.0, help="Spectral radius scaling")
+    args_parser.add_argument("--win_std", type=float, default=0.2, help="Input scaling")
     
     args_parser.add_argument("--log_every", type=int, default=20)
     args_parser.add_argument("--seed", type=int, default=0)
