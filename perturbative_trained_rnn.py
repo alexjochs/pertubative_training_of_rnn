@@ -380,6 +380,7 @@ def main() -> None:
 
     def train_decoder_on_batch(seed: int, z_batch: torch.Tensor) -> float:
         # z_batch: [B, T, D]
+        # print("    [train_decoder] Start...", flush=True)
         B, T, _ = z_batch.shape
         res0.set_adapter_from_theta(theta)
 
@@ -413,12 +414,17 @@ def main() -> None:
     for it in range(1, args.iters + 1):
         seed_it = base_seed + it
         
+        if it % 1 == 0:
+            print(f"Main: Starting iter {it}...", flush=True)
+            
         # A. Get Batch for this iteration
         # We use the same batch for base and all candidates to reduce variance
         z_batch = get_batch(seed_it, args.batch)
 
         # B. Train Decoder / Get Base Loss
+        # print("  [Main] Training decoder...", flush=True)
         base_loss = train_decoder_on_batch(seed_it, z_batch)
+        # print(f"  [Main] Base loss: {base_loss:.4f}", flush=True)
 
         # C. Sample Antithetic Pairs
         K = args.pairs
@@ -442,11 +448,14 @@ def main() -> None:
         # Vectorizing across weights is hard in standard PyTorch without vmap.
         # So we loop. But since 'step' is just matrix multiplies and z is pre-loaded, it's fast.
         
-        for cand in candidates:
+        for i, cand in enumerate(candidates):
             res0.set_adapter_from_theta(cand)
             loss = res0.rollout_loss(z_batch, decoder, args.warmup)
             cand_losses.append(loss)
+            # if i % 10 == 0:
+            #    print(f"    [Main] Cand {i}/{len(candidates)} evaluated.", flush=True)
         
+        # print("  [Main] Candidates evaluated.", flush=True)
         cand_losses = torch.stack(cand_losses)
         
         # E. Update Theta
