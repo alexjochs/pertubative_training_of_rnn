@@ -119,7 +119,7 @@ class Reservoir(nn.Module):
         W0 = W0.coalesce()
         dt = time.time() - t0
         print(f"  [Reservoir] W0 generated in {dt:.2f}s.", flush=True)
-        return W0
+        return W0.to_dense()
 
     def set_adapter_from_theta(self, theta: torch.Tensor) -> None:
         N, r = self.cfg.N, self.cfg.rank
@@ -131,8 +131,9 @@ class Reservoir(nn.Module):
         self.V.data.copy_(V)
 
     def step(self, h: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        # Recurrent sparse: (W0 @ h^T)^T
-        rec0 = torch.sparse.mm(self.W0, h.t()).t()  # [B,N]
+        # Recurrent dense: h @ W0.t()
+        # W0 is [N, N]. h is [B, N].
+        rec0 = h @ self.W0.t()
 
         # Low-rank: (U V^T) h = U (V^T h)
         low = (h @ self.V) @ self.U.t()
