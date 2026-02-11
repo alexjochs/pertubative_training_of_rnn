@@ -1,11 +1,10 @@
-#!/usr/bin/env python3
+
 """
 Perturbative Trained RNN (Single-Process GPU Optimized)
 
-Optimizations:
-1. Pre-compute embeddings for the entire dataset (Encoder is frozen).
-2. Remove multiprocessing overhead.
-3. Run ES loop on GPU.
+This script implements an Evolutionary Strategy (ES) to train a Recurrent Neural Network (RNN) 
+with a low-rank perturbative adapter. It is optimized for high-performance GPUs (like H200) 
+by pre-computing embeddings and running the entire ES loop on the GPU to avoid CPU-GPU bottlenecks.
 """
 
 from __future__ import annotations
@@ -176,12 +175,104 @@ class Reservoir(nn.Module):
         return torch.stack(losses).mean()
 
 
-def make_decoder(N: int, D: int, device: torch.device) -> nn.Linear:
-    decoder = nn.Linear(N, D, bias=True).to(device)
-    # Using Xavier init
-    nn.init.xavier_normal_(decoder.weight)
-    nn.init.zeros_(decoder.bias)
-    return decoder
+
+    @torch.no_grad()
+    def batched_rollout_loss(self, z_seq: torch.Tensor, decoder: nn.Linear, warmup: int, 
+                             cand_U: torch.Tensor, cand_V: torch.Tensor) -> torch.Tensor:
+        """
+        Batched rollout for multiple candidates simultaneously.
+        z_seq: [B, T, D] (shared input)
+        cand_U: [K, N, R]
+        cand_V: [K, N, R]
+        
+        Returns: [K] losses
+        """
+        K = cand_U.shape[0]  # Number of candidates
+        B, T, D = z_seq.shape
+        N = self.cfg.N
+        
+        # Initial state h: [K, B, N]
+        h = torch.zeros((K, B, N), device=self.device, dtype=torch.float32)
+        
+        losses = []
+        z_in = z_seq[:, 0] # [B, D] - shared across K
+        
+        # Pre-compute W0 transpose for efficiency if possible, but W0 is sparse [N, N]
+        # We can't batch sparse MATMUL easily with [K, B, N].
+        # However, W0 is shared. h @ W0.t() is [K*B, N] @ [N, N].
+        # We can reshape h to [K*B, N] to use sparse mm.
+        
+        # Win is shared. z @ Win.t() is [B, N]. Broadcast to [K, B, N].
+        
+        for t in range(T - 1):
+            # 1. Recurrent Base: h @ W0.t()
+            # Reshape h to [K*B, N]
+            h_flat = h.view(K * B, N)
+            rec0 = (h_flat @ self.W0.t()).view(K, B, N)
+            
+            # 2. Low-Rank Adapter: (h @ V) @ U.t()
+            # h: [K, B, N], V: [K, N, R] -> [K, B, R]
+            # specific V per K.
+            # torch.bmm is [B, N, M] x [B, M, P].
+            # We want [K, B, N] x [K, N, R].
+            # bmm works on the first dim K!
+            low_temp = torch.bmm(h, cand_V) # [K, B, R]
+            
+            # Now [K, B, R] x [K, R, N] (U transposed)
+            # U is [K, N, R], so U.transpose(1, 2) is [K, R, N]
+            low = torch.bmm(low_temp, cand_U.transpose(1, 2)) # [K, B, N]
+            
+            # 3. Input: z @ Win.t()
+            # z_in is [K, B, D] or [B, D]?
+            # If z_in varies per candidate (due to feedback), it must be [K, B, D].
+            # Initially z_in is [B, D] (shared).
+            if z_in.dim() == 2:
+                inp = z_in @ self.Win.t() # [B, N]
+                inp = inp.unsqueeze(0).expand(K, -1, -1) # [K, B, N]
+            else:
+                 # z_in is [K, B, D]
+                 # We need to reshape to apply shared Win
+                 z_in_flat = z_in.view(K * B, D)
+                 inp = (z_in_flat @ self.Win.t()).view(K, B, N)
+            
+            pre = rec0 + low + inp + self.b # b broadcasted
+            
+            nh = torch.tanh(pre)
+            h = (1.0 - self.cfg.leak) * h + self.cfg.leak * nh
+            
+            # Decode
+            # Decoder is shared. h: [K, B, N]
+            # We can reshape to [K*B, N]
+            h_flat_next = h.view(K * B, N)
+            pred_flat = decoder(h_flat_next) # [K*B, D]
+            pred = pred_flat.view(K, B, D)
+            
+            target = z_seq[:, t + 1] # [B, D] shared
+            
+            if t >= warmup:
+                # Loss calculation
+                # MSE: (pred - target)^2
+                # Target broadcasted to [K, B, D]
+                err = pred - target.unsqueeze(0)
+                mse = (err ** 2).mean(dim=[1, 2]) # Mean over B and D, keep K
+                losses.append(mse)
+                
+                # Feedback: Feeding back prediction
+                z_in = pred
+            else:
+                # Feedback: Teacher forcing (GT)
+                z_in = target # [B, D] shared (so dim=2)
+                
+            # Check stability (simple check on one random batch/cand, or max)
+            # if h.abs().max() > self.cfg.h_clip: ... costly to check all
+            # Let's skip check for speed on H200 or do loosely
+            pass
+
+        if len(losses) == 0:
+            return torch.zeros(K, device=self.device)
+            
+        return torch.stack(losses).mean(dim=0) # [K]
+
 
 
 
@@ -294,48 +385,49 @@ def precompute_embeddings(args, dev0):
             if i % 10 == 0:
                 print(f"  Encoded batch {i}/{len(loader)}", flush=True)
 
-    # Concatenate all
-    full_z = torch.cat(all_embeddings, dim=0) # [N_total, T, D]
-    dt = time.time() - t0
-    print(f"Pre-computation complete. Shape: {full_z.shape}. Time: {dt:.2f}s", flush=True)
+    # Concatenate all embeddings
+    full_embeddings = torch.cat(all_embeddings, dim=0) # [N_total, T, D]
+    elapsed = time.time() - t0
+    print(f"Pre-computation complete. Shape: {full_embeddings.shape}. Time: {elapsed:.2f}s", flush=True)
     
-    # Move to GPU if it fits? 
-    # 10000 * 20 * 128 * 4 bytes = ~100 MB. Fits easily.
-    return full_z.to(dev0)
+    return full_embeddings.to(device)
 
 
 def main() -> None:
     # Disable cuDNN benchmarking to prevent hangs during algorithm search
     torch.backends.cudnn.benchmark = False
     
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data_root", type=str, default="./data")
-    ap.add_argument("--gpus", type=int, default=1, help="Ignored in single process mode, kept for compat")
-    ap.add_argument("--hidden", type=int, default=2000)
-    ap.add_argument("--emb_dim", type=int, default=128)
-    ap.add_argument("--rank", type=int, default=32)
-    ap.add_argument("--k_in", type=int, default=50)
+    args_parser = argparse.ArgumentParser(description="P-RNN Training Script")
+    args_parser.add_argument("--data_root", type=str, default="./data", help="Root directory for datasets")
+    args_parser.add_argument("--gpus", type=int, default=1, help="Number of GPUs (Ignored in simple single-proc mode)")
+    args_parser.add_argument("--hidden", type=int, default=2000, help="Reservoir hidden size (N)")
+    args_parser.add_argument("--emb_dim", type=int, default=128, help="Embedding dimension (D)")
+    args_parser.add_argument("--rank", type=int, default=32, help="Rank of perturbation matrix")
+    args_parser.add_argument("--k_in", type=int, default=50, help="Sparsity of W0 (connections per neuron)")
 
-    ap.add_argument("--T", type=int, default=20)
-    ap.add_argument("--warmup", type=int, default=15)
-    ap.add_argument("--batch", type=int, default=16)
+    args_parser.add_argument("--T", type=int, default=20, help="Sequence length")
+    args_parser.add_argument("--warmup", type=int, default=15, help="Warmup steps before tracking loss")
+    args_parser.add_argument("--batch", type=int, default=16, help="Batch size for ES evaluation")
     
     ap.add_argument("--iters", type=int, default=2000)
     ap.add_argument("--pairs", type=int, default=32)
     ap.add_argument("--sigma", type=float, default=0.1)
-    ap.add_argument("--theta_lr", type=float, default=0.01)
+    args_parser.add_argument("--iters", type=int, default=2000, help="Total ES iterations")
+    args_parser.add_argument("--pairs", type=int, default=32, help="Number of antithetic perturbation pairs per iter")
+    args_parser.add_argument("--sigma", type=float, default=0.1, help="Perturbation standard deviation")
+    args_parser.add_argument("--theta_lr", type=float, default=0.01, help="Learning rate for adapter (theta)")
     
-    ap.add_argument("--dec_lr", type=float, default=0.001)
-    ap.add_argument("--dec_steps", type=int, default=1)
+    args_parser.add_argument("--dec_lr", type=float, default=0.001, help="Learning rate for readout decoder")
+    args_parser.add_argument("--dec_steps", type=int, default=1, help="Decoder training steps per ES iter")
 
     ap.add_argument("--leak", type=float, default=0.1)
     ap.add_argument("--h_clip", type=float, default=50.0)
     ap.add_argument("--w0_std", type=float, default=1.0)
     ap.add_argument("--win_std", type=float, default=0.2)
     
-    ap.add_argument("--log_every", type=int, default=20)
-    ap.add_argument("--seed", type=int, default=0)
-    args = ap.parse_args()
+    args_parser.add_argument("--log_every", type=int, default=20)
+    args_parser.add_argument("--seed", type=int, default=0)
+    args = args_parser.parse_args()
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     results_dir = f"results/{timestamp}"
@@ -351,66 +443,66 @@ def main() -> None:
     torch.manual_seed(args.seed)
     
     if torch.cuda.is_available():
-        dev0 = torch.device("cuda:0")
+        device = torch.device("cuda:0")
     else:
-        dev0 = torch.device("cpu")
-    print(f"Device: {dev0}")
+        device = torch.device("cpu")
+    print(f"Device: {device}")
 
     # 1. Pre-compute embeddings
-    dataset_z = precompute_embeddings(args, dev0)
-    dataset_len = len(dataset_z)
+    dataset_embeddings = precompute_embeddings(args, device)
+    dataset_len = len(dataset_embeddings)
 
-    # 2. Setup Models
+    # 2. Setup Modeis
     N, D, rnk = args.hidden, args.emb_dim, args.rank
     theta_dim = 2 * N * rnk
 
-    theta = torch.zeros(theta_dim, dtype=torch.float32, device=dev0) # Keep theta on GPU now
-    # theta_opt = torch.optim.Adam([theta], lr=args.theta_lr) # We do manual update for ES usually, or use Adam?
-    # Original code used Adam for Theta.
-    theta_opt = torch.optim.Adam([theta], lr=args.theta_lr)
+    # Theta: The flattened parameter vector for the low-rank adapter (U, V)
+    theta = torch.zeros(theta_dim, dtype=torch.float32, device=device) 
+    
+    # Use Adam for optimizing theta (applied to the estimated gradient)
+    theta_optimizer = torch.optim.Adam([theta], lr=args.theta_lr)
 
-    decoder = make_decoder(N, D, device=dev0)
-    dec_opt = torch.optim.Adam(decoder.parameters(), lr=args.dec_lr)
+    decoder = make_decoder(N, D, device=device)
+    decoder_optimizer = torch.optim.Adam(decoder.parameters(), lr=args.dec_lr)
 
-    cfg0 = ReservoirConfig(
+    config = ReservoirConfig(
         N=N, D=D, rank=rnk, leak=args.leak, h_clip=args.h_clip,
         k_in=args.k_in, w0_std=args.w0_std, win_std=args.win_std
     )
-    res0 = Reservoir(cfg0, device=dev0).to(dev0)
-    res0.eval()
+    reservoir = Reservoir(config, device=device).to(device)
+    reservoir.eval()
 
     # Create a reusable generator to avoid overhead/potential issues
-    batch_gen = torch.Generator(device=dev0)
+    batch_generator = torch.Generator(device=device)
 
     def get_batch(seed: int, batch_size: int) -> torch.Tensor:
-        batch_gen.manual_seed(seed)
-        indices = torch.randint(0, dataset_len, (batch_size,), generator=batch_gen, device=dev0)
-        return dataset_z[indices] # [B, T, D]
+        """Sample a batch of pre-computed embeddings using a specific seed."""
+        batch_generator.manual_seed(seed)
+        indices = torch.randint(0, dataset_len, (batch_size,), generator=batch_generator, device=device)
+        return dataset_embeddings[indices] # [B, T, D]
 
     def train_decoder_on_batch(seed: int, z_batch: torch.Tensor) -> float:
-        # z_batch: [B, T, D]
-        # print("    [train_decoder] Start...", flush=True)
+        """Train the readout decoder on the current batch using the base theta."""
         B, T, _ = z_batch.shape
-        res0.set_adapter_from_theta(theta)
+        reservoir.set_adapter_from_theta(theta)
 
         decoder.train()
         for _ in range(args.dec_steps):
-            dec_opt.zero_grad(set_to_none=True)
-            h = torch.zeros((B, N), device=dev0)
+            decoder_optimizer.zero_grad(set_to_none=True)
+            h = torch.zeros((B, N), device=device)
             loss_steps = []
             
-            # Use teacher forcing for decoder training or rollout?
-            # Usually teacher forcing is better for training the readout
+            # Forward pass: Using teacher forcing for stable decoder training
             for t in range(T - 1):
                 zt = z_batch[:, t]
                 with torch.no_grad():
-                    h = res0.step(h, zt)
+                    h = reservoir.step(h, zt)
                 pred = decoder(h)
                 loss_steps.append(F.mse_loss(pred, z_batch[:, t + 1], reduction="mean"))
             
             loss = torch.stack(loss_steps).mean()
             loss.backward()
-            dec_opt.step()
+            decoder_optimizer.step()
 
         decoder.eval()
         return float(loss.detach().cpu().item())
@@ -418,124 +510,142 @@ def main() -> None:
     # 3. ES Loop
     base_seed = 10_000_000 + args.seed * 1_000_000
     print("Main: Starting ES loop...", flush=True)
-    t0 = time.time()
+    start_time = time.time()
 
-    for it in range(1, args.iters + 1):
-        seed_it = base_seed + it
+    for iteration in range(1, args.iters + 1):
+        seed_it = base_seed + iteration
         
-        if it % 1 == 0:
-            print(f"Main: Starting iter {it}...", flush=True)
+        if iteration % 1 == 0:
+            print(f"Main: Starting iter {iteration}...", flush=True)
             
         # A. Get Batch for this iteration
-        # We use the same batch for base and all candidates to reduce variance
+        # We share the same batch across candidates to reduce variance
         z_batch = get_batch(seed_it, args.batch)
 
-        # B. Train Decoder / Get Base Loss
-        # print("  [Main] Training decoder...", flush=True)
+        # B. Train Decoder to get baseline loss
+        # Note: We train the decoder *before* sampling candidates so the readout is optimal for the current theta
         base_loss = train_decoder_on_batch(seed_it, z_batch)
-        # print(f"  [Main] Base loss: {base_loss:.4f}", flush=True)
 
-        # C. Sample Antithetic Pairs
-        K = args.pairs
-        # Generate noise directly on GPU
-        eps = torch.randn((K, theta_dim), device=dev0, dtype=torch.float32)
+        # D. Evaluate Candidates - VECTORIZED
+        # 1. Expand parameters for all candidates: K = 2 * args.pairs
+        # We need U [K, N, r] and V [K, N, r]
+        # theta is [2*N*r].
+        # We generate noise epsilon [pairs, 2*N*r].
+        # candidates = theta +/- sigma * epsilon
         
-        candidates = []
-        for sign in [1.0, -1.0]:
-            for k in range(K):
-                cand = theta + sign * args.sigma * eps[k]
-                candidates.append(cand)
+        # Let's construct pop_theta directly as a tensor [K, theta_dim]
+        # epsilon is [args.pairs, theta_dim].
+        # theta is [theta_dim].
         
-        # D. Evaluate Candidates
-        # Sequential evaluation on GPU is fast enough because of pre-computation
-        # We can also batch this if we really wanted to, but let's keep it simple first
-        cand_losses = []
+        # Pos candidates: theta + sigma * epsilon
+        theta_unsqueezed = theta.unsqueeze(0)
+        pop_pos = theta_unsqueezed + args.sigma * epsilon
+        pop_neg = theta_unsqueezed - args.sigma * epsilon
         
-        # We can reuse the same z_batch for all candidates
-        # To vectorize this: stack the batch? 
-        # But we change weights (U, V).
-        # Vectorizing across weights is hard in standard PyTorch without vmap.
-        # So we loop. But since 'step' is just matrix multiplies and z is pre-loaded, it's fast.
+        pop_theta = torch.cat([pop_pos, pop_neg], dim=0) # [K, theta_dim] where K = 2*pairs
         
-        for i, cand in enumerate(candidates):
-            res0.set_adapter_from_theta(cand)
-            loss = res0.rollout_loss(z_batch, decoder, args.warmup)
-            cand_losses.append(loss)
-            # if i % 10 == 0:
-            #    print(f"    [Main] Cand {i}/{len(candidates)} evaluated.", flush=True)
+        # Reshape into U and V
+        # theta structure: [U_flat, V_flat]
+        N, r = args.hidden, args.rank
+        U_size = N * r
         
-        # print("  [Main] Candidates evaluated.", flush=True)
-        cand_losses = torch.stack(cand_losses)
+        pop_U_flat = pop_theta[:, :U_size]
+        pop_V_flat = pop_theta[:, U_size:]
+        
+        cand_U = pop_U_flat.view(-1, N, r)
+        cand_V = pop_V_flat.view(-1, N, r)
+        
+        # Batched Rollout
+        # z_batch is [B, T, D]
+        # Memory Check:
+        # h state: [K, B, N]
+        # K=8192, B=256, N=4096 => 8192*256*4096*4 bytes = 34 GB.
+        # H200 has 141 GB. Safe.
+        
+        try:
+            cand_losses = reservoir.batched_rollout_loss(z_batch, decoder, args.warmup, cand_U, cand_V)
+        except torch.cuda.OutOfMemoryError:
+            print("WARNING: OOM with full batch. Switching to chunked evaluation.", flush=True)
+            # Fallback to chunks of 1024
+            chunk_size = 1024
+            loss_chunks = []
+            for i in range(0, len(pop_theta), chunk_size):
+                u_chunk = cand_U[i : i + chunk_size]
+                v_chunk = cand_V[i : i + chunk_size]
+                l_chunk = reservoir.batched_rollout_loss(z_batch, decoder, args.warmup, u_chunk, v_chunk)
+                loss_chunks.append(l_chunk)
+            cand_losses = torch.cat(loss_chunks)
+
         
         # E. Update Theta
-        # Reconstruct pairs
         losses_pos = cand_losses[:K]
         losses_neg = cand_losses[K:]
         
-        # Fitness shaping (using all losses together)
-        w = rank_transform(cand_losses)
-        w_pos = w[:K]
-        w_neg = w[K:]
+        # Fitness shaping (rank transformation)
+        fitness_weights = rank_transform(cand_losses)
+        w_pos = fitness_weights[:K]
+        w_neg = fitness_weights[K:]
         
-        # Gradient estimate
-        # g = (w_pos - w_neg) * eps / (2 * sigma) ... roughly
-        # Actually standard ES: sum(w_i * eps_i)
+        # Gradient Estimation:
+        # grad ~ (w_pos - w_neg) * eps
+        # We expand views to broadcast: [K, 1] * [K, dim] -> [K, dim] -> mean -> [dim]
+        grad_estimate = (w_pos.view(-1, 1) * epsilon - w_neg.view(-1, 1) * epsilon).mean(dim=0)
         
-        # eps corresponds to pos. -eps corresponds to neg.
-        # grad ~ sum( w_pos[k] * eps[k] + w_neg[k] * (-eps[k]) )
-        grad_est = (w_pos.view(-1, 1) * eps - w_neg.view(-1, 1) * eps).mean(dim=0)
-        # This simplifies to (w_pos - w_neg) * eps
+        # Optimization Step
+        # Since we want to Minimize loss but rank_transform assigns higher values to better (lower) losses,
+        # we treat this as maximizing fitness. Adam minimizes, so we negate the gradient.
+        # Wait, let's double check:
+        # Rank transform: Best individual (lowest loss) -> Highest rank -> Positive weight.
+        # Gradient Ascent: theta += alpha * (fitness * noise)
+        # Adam Step (Minimize): theta -= alpha * grad
+        # So we set grad = -(fitness * noise) to achieve ascent.
+        theta.grad = -grad_estimate
         
-        # Adam Step
-        theta.grad = -grad_est # We want to minimize loss, so we move opposite to gradient of loss (which is ascent on fitness?)
-        # Wait, rank transform: low loss -> high rank -> high weight. 
-        # So we want to ASCEND the weighted average.
-        # Adam minimizes. So we set grad = -grad_est.
-        
-        theta_opt.step()
-        theta_opt.zero_grad()
+        theta_optimizer.step()
+        theta_optimizer.zero_grad()
         
         # Logging
-        if it % args.log_every == 0:
-            dt = time.time() - t0
+        # Logging
+        if iteration % args.log_every == 0:
+            elapsed_total = time.time() - start_time
             frac_bad = float((cand_losses >= 1e5).float().mean().item())
             
             # Visualization
-            res0.set_adapter_from_theta(theta)
+            reservoir.set_adapter_from_theta(theta)
             # Visualize first item of current batch
-            viz_path = os.path.join(results_dir, f"viz_iter_{it:04d}.png")
-            visualize_batch(z_batch, decoder, res0, args.warmup, viz_path)
+            viz_path = os.path.join(results_dir, f"viz_iter_{iteration:04d}.png")
+            visualize_batch(z_batch, decoder, reservoir, args.warmup, viz_path)
             
-            # Simple H norm check
+            # Simple Reservoir Hidden State Norm Check
             with torch.no_grad():
-                h_dummy = torch.zeros((1, N), device=dev0)
-                h_dummy = res0.step(h_dummy, z_batch[0,0:1])
+                h_dummy = torch.zeros((1, N), device=device)
+                h_dummy = reservoir.step(h_dummy, z_batch[0,0:1])
                 h_norm = h_dummy.norm().item()
 
             print(
-                f"iter {it:6d}  base_loss {base_loss:10.6f}  "
+                f"iter {iteration:6d}  base_loss {base_loss:10.6f}  "
                 f"cand_loss[min/med] {cand_losses.min().item():.6f}/{cand_losses.median().item():.6f}  "
                 f"bad_frac {frac_bad:.2f}  "
                 f"|theta| {theta.norm().item():.3f}  "
                 f"|h| {h_norm:.2f}  "
-                f"elapsed {dt/60:.1f}m",
+                f"elapsed {elapsed_total/60:.1f}m",
                 flush=True
             )
             
             csv_logger.log({
-                "iter": it,
+                "iter": iteration,
                 "base_loss": base_loss,
                 "min_loss": cand_losses.min().item(),
                 "med_loss": cand_losses.median().item(),
                 "bad_frac": frac_bad,
                 "theta_norm": theta.norm().item(),
                 "h_norm": h_norm,
-                "elapsed_min": dt/60
+                "elapsed_min": elapsed_total/60
             })
             
             ckpt_path = os.path.join(results_dir, "checkpoint_latest.pt")
             torch.save({
-                "iter": it,
+                "iter": iteration,
                 "theta": theta,
                 "decoder": decoder.state_dict(),
                 "args": vars(args)

@@ -82,7 +82,7 @@ export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
 python3 perturbative_trained_rnn.py \
     --gpus 1 \
     --iters 5000 \
-    --pairs 512 \
+    --pairs 4096 \
     --batch 512 \
     --hidden 4096 \
     --log_every 50 \
