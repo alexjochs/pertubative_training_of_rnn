@@ -189,13 +189,21 @@ def make_decoder(N: int, D: int, device: torch.device) -> nn.Linear:
     return decoder
 
 
+
 def rank_transform(raw_losses: torch.Tensor) -> torch.Tensor:
+    log_debug("rank_transform: start")
     M = len(raw_losses)
     ranks = torch.empty_like(raw_losses)
+    log_debug("rank_transform: empty_like done")
     order = torch.argsort(raw_losses)
-    ranks[order] = torch.arange(M, dtype=torch.float32)
+    log_debug("rank_transform: argsort done")
+    # FIX: Ensure arange is on the same device as ranks
+    ranks[order] = torch.arange(M, dtype=torch.float32, device=raw_losses.device)
+    log_debug("rank_transform: arange assignment done")
     w = -(ranks / (M - 1) - 0.5)
+    log_debug("rank_transform: w calculation done")
     w = w - w.mean()
+    log_debug("rank_transform: return")
     return w
 
 
@@ -488,13 +496,15 @@ def main() -> None:
         log_debug(f"Main: Candidates stacked. Shape: {cand_losses.shape}")
         
         # E. Update Theta
-        log_debug("Main: Update Theta")
+        log_debug("Main: Update Theta - Start")
         # Reconstruct pairs
         losses_pos = cand_losses[:K]
         losses_neg = cand_losses[K:]
+        log_debug("Main: Update Theta - Split losses_pos/neg")
         
         # Fitness shaping (using all losses together)
         w = rank_transform(cand_losses)
+        log_debug("Main: Update Theta - rank_transform complete")
         w_pos = w[:K]
         w_neg = w[K:]
         
@@ -504,16 +514,23 @@ def main() -> None:
         
         # eps corresponds to pos. -eps corresponds to neg.
         # grad ~ sum( w_pos[k] * eps[k] + w_neg[k] * (-eps[k]) )
+        log_debug("Main: Update Theta - grad_est calculation start")
+        # Ensure w_pos, w_neg are views or reshaped correctly, check devices? Should be OK.
+        log_debug(f"Main: w_pos shape: {w_pos.shape}, eps shape: {eps.shape}, device: {eps.device}")
+        
         grad_est = (w_pos.view(-1, 1) * eps - w_neg.view(-1, 1) * eps).mean(dim=0)
+        log_debug("Main: Update Theta - grad_est computed")
         # This simplifies to (w_pos - w_neg) * eps
         
         # Adam Step
         theta.grad = -grad_est # We want to minimize loss, so we move opposite to gradient of loss (which is ascent on fitness?)
+        log_debug("Main: Update Theta - assigned theta.grad")
         # Wait, rank transform: low loss -> high rank -> high weight. 
         # So we want to ASCEND the weighted average.
         # Adam minimizes. So we set grad = -grad_est.
         
         theta_opt.step()
+        log_debug("Main: Update Theta - optimizer step done")
         theta_opt.zero_grad()
         log_debug("Main: Iteration complete")
         
