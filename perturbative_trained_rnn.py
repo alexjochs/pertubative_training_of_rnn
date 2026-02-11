@@ -197,60 +197,58 @@ class Reservoir(nn.Module):
         losses = []
         z_in = z_seq[:, 0] # [B, D] - shared across K
         
-        # Pre-compute W0 transpose for efficiency if possible, but W0 is sparse [N, N]
-        # We can't batch sparse MATMUL easily with [K, B, N].
-        # However, W0 is shared. h @ W0.t() is [K*B, N] @ [N, N].
-        # We can reshape h to [K*B, N] to use sparse mm.
-        
-        # Win is shared. z @ Win.t() is [B, N]. Broadcast to [K, B, N].
+        # Memory Optimization:
+        # We perform operations in-place on 'pre' to avoid allocating multiple [K, B, N] buffers.
+        # Peak memory is dominated by: h, pre, nh (3 * K*B*N) instead of 5-6 * K*B*N.
         
         for t in range(T - 1):
-            # 1. Recurrent Base: h @ W0.t()
-            # Reshape h to [K*B, N]
-            h_flat = h.view(K * B, N)
-            rec0 = (h_flat @ self.W0.t()).view(K, B, N)
+            # 1. Initialize pre-activation with Input term
+            # z_in is [B, D] (shared) or [K, B, D]
             
-            # 2. Low-Rank Adapter: (h @ V) @ U.t()
-            # h: [K, B, N], V: [K, N, R] -> [K, B, R]
-            # specific V per K.
-            # torch.bmm is [B, N, M] x [B, M, P].
-            # We want [K, B, N] x [K, N, R].
-            # bmm works on the first dim K!
-            low_temp = torch.bmm(h, cand_V) # [K, B, R]
-            
-            # Now [K, B, R] x [K, R, N] (U transposed)
-            # U is [K, N, R], so U.transpose(1, 2) is [K, R, N]
-            low = torch.bmm(low_temp, cand_U.transpose(1, 2)) # [K, B, N]
-            
-            # 3. Input: z @ Win.t()
-            # z_in is [K, B, D] or [B, D]?
-            # If z_in varies per candidate (due to feedback), it must be [K, B, D].
-            # Initially z_in is [B, D] (shared).
-            # 3. Input: z @ Win.t()
-            # z_in is [K, B, D] or [B, D]?
-            # If z_in varies per candidate (due to feedback), it must be [K, B, D].
-            # Initially z_in is [B, D] (shared).
             if z_in.dim() == 2:
-                inp = z_in @ self.Win.t() # [B, N]
-                inp = inp.unsqueeze(0).expand(K, -1, -1) # [K, B, N]
+                # Shared input [B, D] -> [B, N]
+                inp_small = z_in @ self.Win.t()
+                # Expand to [K, B, N] and clone to create the 'pre' buffer
+                pre = inp_small.unsqueeze(0).expand(K, B, N).clone()
             else:
-                 # z_in is [K, B, D]
-                 # We need to reshape to apply shared Win
-                 z_in_flat = z_in.view(K * B, D)
-                 inp = (z_in_flat @ self.Win.t()).view(K, B, N)
+                # Individual input [K, B, D] -> [KB, N] -> [K, B, N]
+                pre = (z_in.view(K * B, D) @ self.Win.t()).view(K, B, N)
             
-            pre = rec0 + low + inp + self.b # b broadcasted
+            # 2. Add Bias
+            pre.add_(self.b)
             
-            # DEBUG: Memory after big ops
+            # 3. Add Recurrent Base: h @ W0.t()
+            # W0 is dense. h is [K, B, N].
+            # We use addmm_ on flattened views: [KB, N] + [KB, N] @ [N, N]
+            h_flat = h.view(K * B, N)
+            pre_flat = pre.view(K * B, N)
+            pre_flat.addmm_(h_flat, self.W0.t())
+            
+            # 4. Add Low-Rank Adapter: (h @ V) @ U.t()
+            # low_temp = h @ V -> [K, B, R] (Smaller tensor)
+            low_temp = torch.bmm(h, cand_V)
+            
+            # pre += low_temp @ U.t()
+            # cand_U is [K, N, R]. Transpose to [K, R, N].
+            # baddbmm_ -> pre + alpha * (low_temp @ cand_U.t())
+            pre.baddbmm_(low_temp, cand_U.transpose(1, 2))
+            
+            # DEBUG: Memory check at t=0
             if t == 0:
-                 print(f"DEBUG[t=0]: After pre-calc: {torch.cuda.memory_allocated()/1e9:.2f} GB", flush=True)
+                 # Calculate approximate GB
+                 mem_gb = torch.cuda.memory_allocated() / 1e9
+                 print(f"DEBUG[t=0]: Memory Optimized: {mem_gb:.2f} GB", flush=True)
 
+            # 5. Activation
             nh = torch.tanh(pre)
-            h = (1.0 - self.cfg.leak) * h + self.cfg.leak * nh
+            
+            # 6. Update h in-place
+            # h = (1 - leak) * h + leak * nh
+            h.mul_(1.0 - self.cfg.leak)
+            h.add_(nh, alpha=self.cfg.leak)
             
             # Decode
             # Decoder is shared. h: [K, B, N]
-            # We can reshape to [K*B, N]
             h_flat_next = h.view(K * B, N)
             pred_flat = decoder(h_flat_next) # [K*B, D]
             pred = pred_flat.view(K, B, D)
@@ -260,7 +258,6 @@ class Reservoir(nn.Module):
             if t >= warmup:
                 # Loss calculation
                 # MSE: (pred - target)^2
-                # Target broadcasted to [K, B, D]
                 err = pred - target.unsqueeze(0)
                 mse = (err ** 2).mean(dim=[1, 2]) # Mean over B and D, keep K
                 losses.append(mse)
@@ -269,13 +266,8 @@ class Reservoir(nn.Module):
                 z_in = pred
             else:
                 # Feedback: Teacher forcing (GT)
-                z_in = target # [B, D] shared (so dim=2)
-                
-            # Check stability (simple check on one random batch/cand, or max)
-            # if h.abs().max() > self.cfg.h_clip: ... costly to check all
-            # Let's skip check for speed on H200 or do loosely
-            pass
-
+                z_in = target # [B, D]
+            
         if len(losses) == 0:
             return torch.zeros(K, device=self.device)
             
@@ -588,22 +580,9 @@ def main() -> None:
         # K=8192, B=128, N=4096 => 8192*128*4096*4 bytes = 17 GB.
         # But intermediate states expand ~5x.
         
-        try:
-            # DEBUG: Print memory before full batch
-            print(f"DEBUG: Memory Before Rollout: {torch.cuda.memory_allocated()/1e9:.2f} GB (Allocated), {torch.cuda.memory_reserved()/1e9:.2f} GB (Reserved)", flush=True)
-            cand_losses = reservoir.batched_rollout_loss(z_batch, decoder, args.warmup, cand_U, cand_V)
-        except torch.cuda.OutOfMemoryError: 
-             print(f"WARNING: OOM with full batch. Memory at fail: {torch.cuda.memory_allocated()/1e9:.2f} GB. Cleaning up...", flush=True)
-             torch.cuda.empty_cache()
-             # Fallback to smaller chunks
-             chunk_size = 2048 # Safer chunk size
-             loss_chunks = []
-             for i in range(0, len(pop_theta), chunk_size):
-                 u_chunk = cand_U[i : i + chunk_size]
-                 v_chunk = cand_V[i : i + chunk_size]
-                 l_chunk = reservoir.batched_rollout_loss(z_batch, decoder, args.warmup, u_chunk, v_chunk)
-                 loss_chunks.append(l_chunk)
-             cand_losses = torch.cat(loss_chunks)
+        # DEBUG: Print memory before full batch
+        print(f"DEBUG: Memory Before Rollout: {torch.cuda.memory_allocated()/1e9:.2f} GB (Allocated), {torch.cuda.memory_reserved()/1e9:.2f} GB (Reserved)", flush=True)
+        cand_losses = reservoir.batched_rollout_loss(z_batch, decoder, args.warmup, cand_U, cand_V)
 
         
         # E. Update Theta

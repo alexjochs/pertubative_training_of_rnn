@@ -79,10 +79,11 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
 export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
 
 # Run training (match Slurm GPU request)
+# Optimization: Increased pairs to 8192 (16k candidates) to leverage H200 memory after code optimization.
 python3 perturbative_trained_rnn.py \
     --gpus 1 \
     --iters 5000 \
-    --pairs 4096 \
+    --pairs 8192 \
     --batch 128 \
     --hidden 4096 \
     --log_every 50 \
