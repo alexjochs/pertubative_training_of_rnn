@@ -84,6 +84,7 @@ python3 perturbative_trained_rnn.py \
     --iters 5000 \
     --pairs 4096 \
     --batch 128 \
+    --cand_batch 2048 \
     --hidden 4096 \
     --log_every 50 \
     --warmup 15 \

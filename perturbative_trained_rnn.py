@@ -226,6 +226,10 @@ class Reservoir(nn.Module):
             # z_in is [K, B, D] or [B, D]?
             # If z_in varies per candidate (due to feedback), it must be [K, B, D].
             # Initially z_in is [B, D] (shared).
+            # 3. Input: z @ Win.t()
+            # z_in is [K, B, D] or [B, D]?
+            # If z_in varies per candidate (due to feedback), it must be [K, B, D].
+            # Initially z_in is [B, D] (shared).
             if z_in.dim() == 2:
                 inp = z_in @ self.Win.t() # [B, N]
                 inp = inp.unsqueeze(0).expand(K, -1, -1) # [K, B, N]
@@ -237,6 +241,10 @@ class Reservoir(nn.Module):
             
             pre = rec0 + low + inp + self.b # b broadcasted
             
+            # DEBUG: Memory after big ops
+            if t == 0:
+                 print(f"DEBUG[t=0]: After pre-calc: {torch.cuda.memory_allocated()/1e9:.2f} GB", flush=True)
+
             nh = torch.tanh(pre)
             h = (1.0 - self.cfg.leak) * h + self.cfg.leak * nh
             
@@ -575,22 +583,27 @@ def main() -> None:
         # K=8192, B=256, N=4096 => 8192*256*4096*4 bytes = 34 GB.
         # H200 has 141 GB. Safe.
         
+        # Memory Check:
+        # h state: [K, B, N]
+        # K=8192, B=128, N=4096 => 8192*128*4096*4 bytes = 17 GB.
+        # But intermediate states expand ~5x.
+        
         try:
+            # DEBUG: Print memory before full batch
+            print(f"DEBUG: Memory Before Rollout: {torch.cuda.memory_allocated()/1e9:.2f} GB (Allocated), {torch.cuda.memory_reserved()/1e9:.2f} GB (Reserved)", flush=True)
             cand_losses = reservoir.batched_rollout_loss(z_batch, decoder, args.warmup, cand_U, cand_V)
-        except torch.cuda.OutOfMemoryError:
-            print("WARNING: OOM with full batch. Cleaning up and switching to chunked evaluation.", flush=True)
-            torch.cuda.empty_cache()
-            # Fallback to smaller chunks
-            chunk_size = 512
-            loss_chunks = []
-            for i in range(0, len(pop_theta), chunk_size):
-                u_chunk = cand_U[i : i + chunk_size]
-                v_chunk = cand_V[i : i + chunk_size]
-                l_chunk = reservoir.batched_rollout_loss(z_batch, decoder, args.warmup, u_chunk, v_chunk)
-                loss_chunks.append(l_chunk)
-                # Should we empty cache here too? Maybe overkill but safe.
-                # torch.cuda.empty_cache()
-            cand_losses = torch.cat(loss_chunks)
+        except torch.cuda.OutOfMemoryError: 
+             print(f"WARNING: OOM with full batch. Memory at fail: {torch.cuda.memory_allocated()/1e9:.2f} GB. Cleaning up...", flush=True)
+             torch.cuda.empty_cache()
+             # Fallback to smaller chunks
+             chunk_size = 2048 # Safer chunk size
+             loss_chunks = []
+             for i in range(0, len(pop_theta), chunk_size):
+                 u_chunk = cand_U[i : i + chunk_size]
+                 v_chunk = cand_V[i : i + chunk_size]
+                 l_chunk = reservoir.batched_rollout_loss(z_batch, decoder, args.warmup, u_chunk, v_chunk)
+                 loss_chunks.append(l_chunk)
+             cand_losses = torch.cat(loss_chunks)
 
         
         # E. Update Theta
