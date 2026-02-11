@@ -351,7 +351,7 @@ def visualize_batch(z_seq: torch.Tensor, decoder: nn.Linear, res: Reservoir, war
 def transform_cifar_norm(x):
     return x.float() / 255.0
 
-def precompute_embeddings(args, dev0):
+def precompute_embeddings(args, device):
     print("Pre-computing embeddings for the entire dataset...", flush=True)
     t0 = time.time()
     
@@ -366,7 +366,7 @@ def precompute_embeddings(args, dev0):
     # Create loader
     # Using a large batch size for inference speed
     loader = torch.utils.data.DataLoader(mm0, batch_size=64, shuffle=False, num_workers=4)
-    encoder = PretrainedResNet18Encoder(emb_dim=args.emb_dim).to(dev0)
+    encoder = PretrainedResNet18Encoder(emb_dim=args.emb_dim).to(device)
     encoder.eval()
 
     all_embeddings = []
@@ -377,7 +377,7 @@ def precompute_embeddings(args, dev0):
             if args.T < batch.shape[1]:
                 batch = batch[:, :args.T]
             
-            batch = batch.to(dev0)
+            batch = batch.to(device)
             B, T, _, H, W = batch.shape
             x = batch.reshape(B * T, 1, H, W)
             z = encoder(x).view(B, T, -1) # [B, T, D]
