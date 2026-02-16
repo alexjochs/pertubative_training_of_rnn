@@ -128,7 +128,7 @@ def main():
 
     jit_rollout = jax.jit(rollout_fn)
 
-    print(f"Starting ES loop on {env_id}...")
+    print(f"Starting ES loop on {env_id}...", flush=True)
     start_time = time.time()
     
     for it in range(1, args.iters + 1):
@@ -159,7 +159,7 @@ def main():
             base_ret = float(jit_rollout(theta[None, :], rollout_key)[0])
             elapsed = (time.time() - start_time) / 60
             fps = (args.pairs * 2 * args.episodes_per_candidate * args.rollout_steps) / (time.time() - it_start)
-            print(f"Iter {it:3d} | Base Ret: {base_ret:8.2f} | Cand Mean: {jnp.mean(cand_returns):8.2f} | FPS: {fps:6.0f} | {elapsed:4.1f}m")
+            print(f"Iter {it:3d} | Base Ret: {base_ret:8.2f} | Cand Mean: {jnp.mean(cand_returns):8.2f} | FPS: {fps:6.0f} | {elapsed:4.1f}m", flush=True)
             logger.log({"iter": it, "base_return": base_ret, "cand_mean": float(jnp.mean(cand_returns)), "fps": fps, "elapsed_min": elapsed})
         
         if it % args.checkpoint_every == 0 or it == args.iters:

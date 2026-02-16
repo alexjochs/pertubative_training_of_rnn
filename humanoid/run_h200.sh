@@ -112,6 +112,7 @@ PY
 # Avoid CPU oversubscription and tell JAX to use CUDA on NVIDIA nodes.
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
 unset JAX_PLATFORMS
 export JAX_PLATFORM_NAME=cuda
 export JAX_LOG_COMPILES=1
