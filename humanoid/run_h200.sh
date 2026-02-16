@@ -53,8 +53,29 @@ module list
 echo "nvidia-smi -L:"
 nvidia-smi -L || true
 
-VENV_DIR=".venv"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+if [ -z "${PYTHON_BIN:-}" ]; then
+  for candidate in python3.11 python3.10 python3; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      PYTHON_BIN="$candidate"
+      break
+    fi
+  done
+fi
+
+if [ -z "${PYTHON_BIN:-}" ]; then
+  echo "ERROR: no Python interpreter found (tried python3.11, python3.10, python3)"
+  exit 1
+fi
+
+PY_VER="$($PYTHON_BIN - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)"
+VENV_DIR=".venv_py${PY_VER/./}"
+
+echo "Selected Python: $PYTHON_BIN ($PY_VER)"
+echo "Using venv: $VENV_DIR"
 
 if [ ! -d "$VENV_DIR" ]; then
   echo "Creating venv at $VENV_DIR"
@@ -76,7 +97,11 @@ else
 fi
 
 # MJX stack for CUDA 12.x GPUs.
-python -m pip install --upgrade "jax[cuda12]" "mujoco>=3.2.0" "mujoco-mjx>=3.2.0"
+# Use pinned wheel versions to avoid source builds on cluster nodes.
+python -m pip install --upgrade --only-binary=:all: \
+  "jax[cuda12]==0.4.30" \
+  "mujoco==3.1.6" \
+  "mujoco-mjx==3.1.6"
 
 python - <<'PY'
 import jax
@@ -106,7 +131,7 @@ export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
 
 # Optional preflight (compile-only):
-# python3 humanoid/pertubative_trained_rnn_rl.py \
+# python humanoid/pertubative_trained_rnn_rl.py \
 #     --env_candidates "Humanoid-v4" \
 #     --hidden 1024 \
 #     --rank 32 \
@@ -116,7 +141,7 @@ export PYOPENGL_PLATFORM=egl
 #     --dry_run_compile \
 #     --dry_run_repeats 2
 
-python3 humanoid/pertubative_trained_rnn_rl.py \
+python humanoid/pertubative_trained_rnn_rl.py \
     --env_candidates "Humanoid-v4" \
     --iters 10 \
     --pairs 4096 \

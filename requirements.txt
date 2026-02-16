@@ -4,5 +4,3 @@ torchvision>=0.17.0
 matplotlib
 numpy
 jax>=0.4.30
-mujoco>=3.2.0
-mujoco-mjx>=3.2.0
