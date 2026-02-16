@@ -88,7 +88,7 @@ class MJXHumanoidEnv:
         terminated = self.spec.terminate_when_unhealthy & (~is_healthy)
         
         reward = (self.spec.forward_reward_weight * x_vel + 
-                  (self.spec.healthy_reward if is_healthy else 0.0) -
+                  jnp.where(is_healthy, self.spec.healthy_reward, 0.0) -
                   self.spec.ctrl_cost_weight * jnp.sum(jnp.square(action)))
         
         if self.spec.include_contact_cost:
