@@ -103,8 +103,8 @@ export PYOPENGL_PLATFORM=egl
 
 python3 humanoid/pertubative_trained_rnn_rl.py \
     --env_candidates "Humanoid-v5,Humanoid-v4" \
-    --iters 250 \
-    --pairs 512 \
+    --iters 10 \
+    --pairs 2048 \
     --sigma 0.03 \
     --theta_lr 0.01 \
     --hidden 1024 \
@@ -115,8 +115,9 @@ python3 humanoid/pertubative_trained_rnn_rl.py \
     --candidate_chunk 64 \
     --rollout_steps 500 \
     --torch_num_threads 4 \
-    --log_every 5 \
-    --checkpoint_every 10 \
+    --log_every 1 \
+    --checkpoint_every 1 \
+    --headroom_target_iter_sec 600 \
     --results_root humanoid/results
 
 echo "Humanoid perturbative RL training complete."

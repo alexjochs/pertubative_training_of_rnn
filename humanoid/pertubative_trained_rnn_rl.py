@@ -21,7 +21,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 
 import numpy as np
 import torch
@@ -64,6 +64,26 @@ class CSVLogger:
 
     def close(self) -> None:
         self.file.close()
+
+
+def make_eval_stats() -> Dict[str, Any]:
+    return {
+        "wall_s": 0.0,
+        "policy_s": 0.0,
+        "env_s": 0.0,
+        "tensor_s": 0.0,
+        "chunks": 0,
+        "loop_steps": 0,
+        "effective_env_steps": 0,
+        "actual_env_steps": 0,
+    }
+
+
+def merge_eval_stats(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
+    for key in ("wall_s", "policy_s", "env_s", "tensor_s"):
+        dst[key] += float(src[key])
+    for key in ("chunks", "loop_steps", "effective_env_steps", "actual_env_steps"):
+        dst[key] += int(src[key])
 
 
 def save_config(args: argparse.Namespace, filepath: str) -> None:
@@ -306,7 +326,7 @@ class CandidateEvaluator:
         self,
         chunk_theta: torch.Tensor,
         seed_base: int,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
         """
         Evaluate up to chunk_candidates parameters.
 
@@ -346,20 +366,25 @@ class CandidateEvaluator:
         alive = np.ones(self.num_envs, dtype=bool)
         exploded_by_candidate = np.zeros(C_full, dtype=bool)
 
-        env_steps = 0
+        stats = make_eval_stats()
+        chunk_t0 = time.perf_counter()
 
         for step in range(self.rollout_steps):
             active_count = int(alive.sum())
             if active_count == 0:
                 break
 
-            env_steps += active_count
+            stats["loop_steps"] += 1
+            stats["effective_env_steps"] += active_count
 
+            t_tensor_0 = time.perf_counter()
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).view(C_full, E, self.obs_dim)
 
             alive_mask = torch.as_tensor(alive, device=self.device).view(C_full, E, 1).to(torch.float32)
             h = h * alive_mask
+            stats["tensor_s"] += time.perf_counter() - t_tensor_0
 
+            t_policy_0 = time.perf_counter()
             h, action_t, exploded_t = self.policy.policy_step(h, obs_t, cand_U, cand_V, cand_Wa, cand_ba)
 
             if exploded_t.any():
@@ -367,9 +392,12 @@ class CandidateEvaluator:
                 exploded_by_candidate |= exploded_np.any(axis=1)
                 keep_mask = torch.as_tensor(~exploded_np, device=self.device).view(C_full, E, 1).to(torch.float32)
                 h = h * keep_mask
+            stats["policy_s"] += time.perf_counter() - t_policy_0
 
             action_np = action_t.view(self.num_envs, self.action_dim).detach().cpu().numpy()
+            t_env_0 = time.perf_counter()
             obs, reward, terminated, truncated, _ = self.vec_env.step(action_np)
+            stats["env_s"] += time.perf_counter() - t_env_0
 
             done = np.logical_or(terminated, truncated)
             returns[alive] += reward[alive]
@@ -384,11 +412,15 @@ class CandidateEvaluator:
         returns_c = returns.reshape(C_full, E).mean(axis=1)
         lengths_c = lengths.reshape(C_full, E).mean(axis=1)
 
+        stats["actual_env_steps"] = int(stats["loop_steps"]) * self.num_envs
+        stats["chunks"] = 1
+        stats["wall_s"] = time.perf_counter() - chunk_t0
+
         return (
             returns_c[:C_active].copy(),
             lengths_c[:C_active].copy(),
             exploded_by_candidate[:C_active].copy(),
-            env_steps,
+            stats,
         )
 
     @torch.no_grad()
@@ -396,26 +428,26 @@ class CandidateEvaluator:
         self,
         population_theta: torch.Tensor,
         seed_base: int,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
         num_candidates = population_theta.shape[0]
         returns = np.zeros(num_candidates, dtype=np.float64)
         lengths = np.zeros(num_candidates, dtype=np.float64)
         exploded = np.zeros(num_candidates, dtype=bool)
 
-        total_steps = 0
+        total_stats = make_eval_stats()
 
         for chunk_idx, start in enumerate(range(0, num_candidates, self.chunk_candidates)):
             end = min(start + self.chunk_candidates, num_candidates)
             chunk = population_theta[start:end]
 
             chunk_seed = int(seed_base + chunk_idx * 100_003)
-            r, l, e, steps = self.evaluate_chunk(chunk, chunk_seed)
+            r, l, e, stats = self.evaluate_chunk(chunk, chunk_seed)
             returns[start:end] = r
             lengths[start:end] = l
             exploded[start:end] = e
-            total_steps += steps
+            merge_eval_stats(total_stats, stats)
 
-        return returns, lengths, exploded, total_steps
+        return returns, lengths, exploded, total_stats
 
 
 def save_checkpoint(
@@ -432,6 +464,31 @@ def save_checkpoint(
         "extra": extra,
     }
     torch.save(payload, path)
+
+
+def get_gpu_stats(device: torch.device) -> Dict[str, float]:
+    out = {
+        "gpu_total_gb": float("nan"),
+        "gpu_free_gb": float("nan"),
+        "gpu_used_frac": float("nan"),
+        "gpu_peak_alloc_gb": float("nan"),
+        "gpu_peak_reserved_gb": float("nan"),
+        "gpu_peak_reserved_frac": float("nan"),
+    }
+    if device.type != "cuda":
+        return out
+
+    free_b, total_b = torch.cuda.mem_get_info(device)
+    peak_alloc = torch.cuda.max_memory_allocated(device)
+    peak_reserved = torch.cuda.max_memory_reserved(device)
+
+    out["gpu_total_gb"] = total_b / 1e9
+    out["gpu_free_gb"] = free_b / 1e9
+    out["gpu_used_frac"] = 1.0 - (free_b / max(total_b, 1))
+    out["gpu_peak_alloc_gb"] = peak_alloc / 1e9
+    out["gpu_peak_reserved_gb"] = peak_reserved / 1e9
+    out["gpu_peak_reserved_frac"] = peak_reserved / max(total_b, 1)
+    return out
 
 
 def parse_args() -> argparse.Namespace:
@@ -464,6 +521,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run_name", type=str, default="")
     parser.add_argument("--log_every", type=int, default=5)
     parser.add_argument("--checkpoint_every", type=int, default=10)
+    parser.add_argument(
+        "--headroom_target_iter_sec",
+        type=float,
+        default=600.0,
+        help="Target iteration duration used to estimate a larger pairs count.",
+    )
 
     return parser.parse_args()
 
@@ -517,6 +580,17 @@ def main() -> None:
             "sigma",
             "mean_ep_len",
             "env_steps",
+            "actual_env_steps",
+            "env_slot_util",
+            "eval_policy_share",
+            "eval_env_share",
+            "cand_per_sec",
+            "gpu_used_frac",
+            "gpu_peak_reserved_frac",
+            "gpu_peak_reserved_gb",
+            "suggest_pairs",
+            "suggest_chunk",
+            "suggest_envs",
             "fps",
             "elapsed_min",
         ],
@@ -589,7 +663,10 @@ def main() -> None:
                 dim=0,
             )
 
-            cand_returns_np, cand_lengths_np, cand_exploded_np, env_steps = evaluator.evaluate_population(
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+
+            cand_returns_np, cand_lengths_np, cand_exploded_np, eval_stats = evaluator.evaluate_population(
                 pop_theta, seed_it
             )
 
@@ -606,16 +683,21 @@ def main() -> None:
 
             base_return = float("nan")
             if iteration % args.log_every == 0 or iteration == 1:
-                base_ret_np, _, _, base_steps = evaluator.evaluate_population(
+                base_ret_np, _, _, base_stats = evaluator.evaluate_population(
                     theta.detach().unsqueeze(0),
                     seed_it + 777,
                 )
                 base_return = float(base_ret_np[0])
-                env_steps += base_steps
+                merge_eval_stats(eval_stats, base_stats)
 
             elapsed = time.time() - start
             iter_elapsed = time.time() - iter_t0
-            fps = float(env_steps / max(iter_elapsed, 1e-6))
+
+            effective_env_steps = int(eval_stats["effective_env_steps"])
+            actual_env_steps = int(eval_stats["actual_env_steps"])
+            fps = float(effective_env_steps / max(iter_elapsed, 1e-6))
+            actual_fps = float(actual_env_steps / max(iter_elapsed, 1e-6))
+            env_slot_util = float(effective_env_steps / max(actual_env_steps, 1))
 
             cand_mean = float(np.mean(cand_returns_np))
             cand_std = float(np.std(cand_returns_np))
@@ -626,19 +708,68 @@ def main() -> None:
             mean_ep_len = float(np.mean(cand_lengths_np))
             theta_norm = float(theta.detach().norm().item())
 
+            timed_total = float(eval_stats["policy_s"] + eval_stats["env_s"] + eval_stats["tensor_s"])
+            eval_policy_share = float(eval_stats["policy_s"] / max(timed_total, 1e-9))
+            eval_env_share = float(eval_stats["env_s"] / max(timed_total, 1e-9))
+            cand_per_sec = float((2 * K) / max(float(eval_stats["wall_s"]), 1e-9))
+
+            gpu = get_gpu_stats(device)
+            gpu_peak_reserved_frac = float(gpu["gpu_peak_reserved_frac"])
+            gpu_peak_reserved_gb = float(gpu["gpu_peak_reserved_gb"])
+            gpu_used_frac = float(gpu["gpu_used_frac"])
+
+            if np.isfinite(gpu_peak_reserved_frac) and gpu_peak_reserved_frac > 0:
+                mem_scale = max(1.0, min(4.0, 0.85 / gpu_peak_reserved_frac))
+            else:
+                mem_scale = 1.0
+
+            if eval_env_share > 0.75:
+                suggest_chunk = args.candidate_chunk
+            else:
+                suggest_chunk = int(max(args.candidate_chunk, round(args.candidate_chunk * mem_scale)))
+
+            suggest_pairs = int(max(args.pairs, round(args.pairs * (args.headroom_target_iter_sec / max(iter_elapsed, 1e-9)))))
+            suggest_envs = int(suggest_chunk * args.episodes_per_candidate)
+
             if iteration % args.log_every == 0 or iteration == 1:
                 np.savez_compressed(
                     os.path.join(metrics_dir, f"candidate_metrics_iter_{iteration:05d}.npz"),
                     returns=cand_returns_np,
                     lengths=cand_lengths_np,
                     exploded=cand_exploded_np.astype(np.int8),
+                    eval_wall_s=float(eval_stats["wall_s"]),
+                    eval_policy_s=float(eval_stats["policy_s"]),
+                    eval_env_s=float(eval_stats["env_s"]),
+                    eval_tensor_s=float(eval_stats["tensor_s"]),
+                    effective_env_steps=effective_env_steps,
+                    actual_env_steps=actual_env_steps,
+                    env_slot_util=env_slot_util,
                 )
 
             print(
                 f"iter {iteration:5d} | base {base_return:9.2f} | "
                 f"cand mean/min/med/max {cand_mean:8.2f}/{cand_min:8.2f}/{cand_med:8.2f}/{cand_max:8.2f} | "
                 f"bad_frac {bad_frac:.3f} | len {mean_ep_len:6.1f} | "
-                f"|theta| {theta_norm:8.2f} | fps {fps:9.1f} | elapsed {elapsed/60.0:7.1f}m",
+                f"|theta| {theta_norm:8.2f} | eff_fps {fps:9.1f} | elapsed {elapsed/60.0:7.1f}m",
+                flush=True,
+            )
+            print(
+                f"  profile | cand/s {cand_per_sec:8.1f} | eval split policy/env/tensor "
+                f"{eval_policy_share*100:5.1f}/{eval_env_share*100:5.1f}/{(1.0-eval_policy_share-eval_env_share)*100:5.1f}% | "
+                f"env_util {env_slot_util*100:5.1f}% ({effective_env_steps}/{actual_env_steps} active slots) | "
+                f"actual_fps {actual_fps:9.1f}",
+                flush=True,
+            )
+            if np.isfinite(gpu_used_frac):
+                print(
+                    f"  gpu     | used {gpu_used_frac*100:5.1f}% | peak_reserved {gpu_peak_reserved_gb:6.2f} GB "
+                    f"({gpu_peak_reserved_frac*100:5.1f}% of total)",
+                    flush=True,
+                )
+            print(
+                f"  headroom| suggest next-run pairs ~{suggest_pairs} "
+                f"(target {args.headroom_target_iter_sec:.0f}s/iter), "
+                f"candidate_chunk ~{suggest_chunk}, envs ~{suggest_envs}",
                 flush=True,
             )
 
@@ -655,7 +786,18 @@ def main() -> None:
                     "theta_norm": theta_norm,
                     "sigma": args.sigma,
                     "mean_ep_len": mean_ep_len,
-                    "env_steps": env_steps,
+                    "env_steps": effective_env_steps,
+                    "actual_env_steps": actual_env_steps,
+                    "env_slot_util": env_slot_util,
+                    "eval_policy_share": eval_policy_share,
+                    "eval_env_share": eval_env_share,
+                    "cand_per_sec": cand_per_sec,
+                    "gpu_used_frac": gpu_used_frac,
+                    "gpu_peak_reserved_frac": gpu_peak_reserved_frac,
+                    "gpu_peak_reserved_gb": gpu_peak_reserved_gb,
+                    "suggest_pairs": suggest_pairs,
+                    "suggest_chunk": suggest_chunk,
+                    "suggest_envs": suggest_envs,
                     "fps": fps,
                     "elapsed_min": elapsed / 60.0,
                 }
