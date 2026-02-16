@@ -79,7 +79,9 @@ fi
 python -m pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
 # RL dependencies for MuJoCo Humanoid.
-python -m pip install --upgrade "gymnasium[mujoco]" mujoco
+# Pin to versions with prebuilt wheels on Python 3.9 to avoid source builds
+# that require MUJOCO_PATH.
+python -m pip install --upgrade "gymnasium[mujoco]==0.29.1" "mujoco==2.3.7"
 
 python - <<'PY'
 import torch
