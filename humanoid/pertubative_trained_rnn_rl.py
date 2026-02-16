@@ -17,7 +17,7 @@ import os
 import pickle
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, NamedTuple, Tuple
+from typing import Any, Dict, List, NamedTuple, Tuple
 
 import numpy as np
 
@@ -36,6 +36,10 @@ except Exception as exc:
     raise RuntimeError(
         "mujoco + mujoco-mjx are required. Install with: pip install mujoco mujoco-mjx"
     ) from exc
+
+FIXED_PAIRS = 8192
+FIXED_CANDIDATE_CHUNK = 256
+DEFAULT_JAX_COMPILE_CACHE_DIR = os.path.join("humanoid", "jax_compile_cache")
 
 
 @dataclass
@@ -773,148 +777,55 @@ def file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def load_tune_cache(path: str) -> Dict[str, Any]:
-    if not path or not os.path.exists(path):
-        return {"version": 1, "entries": {}}
-    with open(path, "r") as f:
-        data = json.load(f)
-    if not isinstance(data, dict):
-        return {"version": 1, "entries": {}}
-    entries = data.get("entries", {})
-    if not isinstance(entries, dict):
-        entries = {}
-    return {"version": 1, "entries": entries}
+def enable_jax_compilation_cache(cache_dir: str) -> str:
+    cache_dir_abs = os.path.abspath(cache_dir)
+    os.makedirs(cache_dir_abs, exist_ok=True)
 
+    enabled = False
+    errors: List[str] = []
 
-def save_tune_cache(path: str, cache: Dict[str, Any]) -> None:
-    if not path:
-        return
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(cache, f, indent=2)
-
-
-def parse_int_grid(spec: str, fallback: List[int]) -> List[int]:
-    if spec.strip():
-        vals = [int(x.strip()) for x in spec.split(",") if x.strip()]
-    else:
-        vals = list(fallback)
-    vals = sorted(set(v for v in vals if int(v) > 0))
-    if not vals:
-        raise RuntimeError("Tuning grid is empty.")
-    return vals
-
-
-def benchmark_shape(
-    build_evaluator: Callable[[int], CandidateEvaluator],
-    theta: jnp.ndarray,
-    pairs: int,
-    chunk: int,
-    sigma: float,
-    seed: int,
-    repeats: int,
-    burnin: int,
-) -> Dict[str, float]:
-    repeats = max(1, int(repeats))
-    burnin = max(0, int(burnin))
-    theta_dim = int(theta.shape[0])
-    evaluator = build_evaluator(chunk)
-    rates: List[float] = []
-    walls: List[float] = []
     try:
-        for i in range(burnin + repeats):
-            key = jax.random.PRNGKey(int(seed + i * 97))
-            eps = jax.random.normal(key, shape=(pairs, theta_dim), dtype=jnp.float32)
-            theta_view = theta[None, :]
-            pop_theta = jnp.concatenate([theta_view + sigma * eps, theta_view - sigma * eps], axis=0)
-            _, _, _, stats = evaluator.evaluate_population(pop_theta, seed_base=int(seed + i * 100_003))
-            if i >= burnin:
-                wall_s = float(stats["wall_s"])
-                eff_steps = float(stats["effective_env_steps"])
-                walls.append(wall_s)
-                rates.append(eff_steps / max(wall_s, 1e-9))
-    finally:
-        evaluator.close()
+        from jax.experimental import compilation_cache as cc  # type: ignore
 
-    gpu = get_gpu_stats()
-    return {
-        "pairs": float(pairs),
-        "chunk": float(chunk),
-        "throughput_median": float(np.median(np.asarray(rates, dtype=np.float64))),
-        "throughput_mean": float(np.mean(np.asarray(rates, dtype=np.float64))),
-        "wall_mean_s": float(np.mean(np.asarray(walls, dtype=np.float64))),
-        "gpu_peak_reserved_frac": float(gpu["gpu_peak_reserved_frac"]),
-        "gpu_peak_reserved_gb": float(gpu["gpu_peak_reserved_gb"]),
-    }
+        set_cache_dir = getattr(cc, "set_cache_dir", None)
+        if set_cache_dir is None:
+            nested_cc = getattr(cc, "compilation_cache", None)
+            if nested_cc is not None:
+                set_cache_dir = getattr(nested_cc, "set_cache_dir", None)
 
+        if set_cache_dir is not None:
+            set_cache_dir(cache_dir_abs)
+            enabled = True
+    except Exception as exc:
+        errors.append(str(exc))
 
-def tune_shapes(
-    build_evaluator: Callable[[int], CandidateEvaluator],
-    theta: jnp.ndarray,
-    args: argparse.Namespace,
-) -> Tuple[Dict[str, float], List[Dict[str, float]]]:
-    pairs_grid = parse_int_grid(
-        args.tune_pairs_grid,
-        [max(64, args.pairs // 2), args.pairs, args.pairs * 2],
-    )
-    chunk_grid = parse_int_grid(
-        args.tune_chunk_grid,
-        [max(16, args.candidate_chunk // 2), args.candidate_chunk, args.candidate_chunk * 2],
-    )
+    if not enabled:
+        try:
+            from jax.experimental.compilation_cache import compilation_cache as cc  # type: ignore
 
-    results: List[Dict[str, float]] = []
-    print(f"[tune] pairs grid: {pairs_grid}", flush=True)
-    print(f"[tune] chunk grid: {chunk_grid}", flush=True)
+            cc.set_cache_dir(cache_dir_abs)
+            enabled = True
+        except Exception as exc:
+            errors.append(str(exc))
 
-    for chunk in chunk_grid:
-        for pairs in pairs_grid:
-            print(f"[tune] testing pairs={pairs}, chunk={chunk}", flush=True)
-            try:
-                r = benchmark_shape(
-                    build_evaluator=build_evaluator,
-                    theta=theta,
-                    pairs=pairs,
-                    chunk=chunk,
-                    sigma=args.sigma,
-                    seed=args.seed + 91_337,
-                    repeats=args.tune_repeats,
-                    burnin=args.tune_burnin,
-                )
-            except Exception as exc:
-                print(f"[tune] failed pairs={pairs}, chunk={chunk}: {exc}", flush=True)
-                continue
-
-            peak_frac = float(r["gpu_peak_reserved_frac"])
-            if np.isfinite(peak_frac) and peak_frac > float(args.tune_peak_reserved_max):
-                print(
-                    f"[tune] reject pairs={pairs}, chunk={chunk} due to peak_reserved_frac={peak_frac:.3f}",
-                    flush=True,
-                )
-                continue
-
-            print(
-                f"[tune] result pairs={pairs}, chunk={chunk} | "
-                f"median_eps={r['throughput_median']:.1f} | wall={r['wall_mean_s']:.2f}s | "
-                f"peak_reserved={r['gpu_peak_reserved_gb']:.2f}GB",
-                flush=True,
-            )
-            results.append(r)
-
-    if not results:
-        raise RuntimeError("No valid tuning candidates were produced.")
-
-    best = max(results, key=lambda x: float(x["throughput_median"]))
-    return best, results
+    if enabled:
+        print(f"[compile] persistent JAX cache: {cache_dir_abs}", flush=True)
+    else:
+        print(
+            f"[compile] warning: failed to enable persistent JAX cache for {cache_dir_abs}: {errors}",
+            flush=True,
+        )
+    return cache_dir_abs
 
 
-def build_tune_key(
+def build_compile_key(
     args: argparse.Namespace,
     env_id: str,
     xml_path: str,
     obs_dim: int,
     action_dim: int,
+    pairs: int,
+    chunk: int,
 ) -> str:
     dev = jax.devices()[0]
     payload = {
@@ -924,6 +835,8 @@ def build_tune_key(
         "action_dim": int(action_dim),
         "hidden": int(args.hidden),
         "rank": int(args.rank),
+        "pairs": int(pairs),
+        "candidate_chunk": int(chunk),
         "episodes_per_candidate": int(args.episodes_per_candidate),
         "rollout_steps": int(args.rollout_steps),
         "jax_version": str(jax.__version__),
@@ -949,12 +862,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--win_std", type=float, default=0.15)
 
     parser.add_argument("--iters", type=int, default=300)
-    parser.add_argument("--pairs", type=int, default=512)
+    parser.add_argument("--pairs", type=int, default=FIXED_PAIRS)
     parser.add_argument("--sigma", type=float, default=0.03)
     parser.add_argument("--theta_lr", type=float, default=0.01)
 
     parser.add_argument("--episodes_per_candidate", type=int, default=2)
-    parser.add_argument("--candidate_chunk", type=int, default=64)
+    parser.add_argument("--candidate_chunk", type=int, default=FIXED_CANDIDATE_CHUNK)
     parser.add_argument("--rollout_steps", type=int, default=500)
 
     parser.add_argument("--init_action_std", type=float, default=0.02)
@@ -965,28 +878,12 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Deprecated compatibility flag; ignored in MJX mode.",
     )
-    parser.add_argument("--tune_only", action="store_true", help="Run shape tuning and exit.")
     parser.add_argument(
-        "--tune_before_train",
-        action="store_true",
-        help="Run shape tuning before training and use tuned values.",
-    )
-    parser.add_argument(
-        "--tune_cache_path",
+        "--compile_cache_dir",
         type=str,
-        default="humanoid/mjx_tune_cache.json",
-        help="Persistent cache of tuned pairs/chunk keyed by model+hardware+versions.",
+        default=DEFAULT_JAX_COMPILE_CACHE_DIR,
+        help="Persistent JAX compilation cache directory.",
     )
-    parser.add_argument(
-        "--ignore_tune_cache",
-        action="store_true",
-        help="Ignore cached tuned values and use CLI pairs/chunk.",
-    )
-    parser.add_argument("--tune_pairs_grid", type=str, default="")
-    parser.add_argument("--tune_chunk_grid", type=str, default="")
-    parser.add_argument("--tune_repeats", type=int, default=2)
-    parser.add_argument("--tune_burnin", type=int, default=1)
-    parser.add_argument("--tune_peak_reserved_max", type=float, default=0.85)
 
     parser.add_argument("--results_root", type=str, default="humanoid/results")
     parser.add_argument("--run_name", type=str, default="")
@@ -1005,6 +902,16 @@ def main() -> None:
         raise RuntimeError("--candidate_chunk must be >= 1")
     if args.episodes_per_candidate < 1:
         raise RuntimeError("--episodes_per_candidate must be >= 1")
+
+    if args.pairs != FIXED_PAIRS:
+        print(f"[config] overriding --pairs={args.pairs} with fixed value {FIXED_PAIRS}", flush=True)
+    if args.candidate_chunk != FIXED_CANDIDATE_CHUNK:
+        print(
+            f"[config] overriding --candidate_chunk={args.candidate_chunk} with fixed value {FIXED_CANDIDATE_CHUNK}",
+            flush=True,
+        )
+    args.pairs = FIXED_PAIRS
+    args.candidate_chunk = FIXED_CANDIDATE_CHUNK
 
     np.random.seed(args.seed)
     rng = jax.random.PRNGKey(args.seed)
@@ -1031,6 +938,8 @@ def main() -> None:
     print(f"Using environment spec: {env_id}", flush=True)
     print(f"MuJoCo XML: {xml_path}", flush=True)
     print(f"Obs dim: {obs_dim}, Action dim: {action_dim}", flush=True)
+
+    compile_cache_dir = enable_jax_compilation_cache(args.compile_cache_dir)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_label = f"{timestamp}_{args.run_name}" if args.run_name else timestamp
@@ -1113,50 +1022,8 @@ def main() -> None:
             policy=policy,
         )
 
-    current_pairs = int(args.pairs)
-    current_chunk = int(args.candidate_chunk)
-
-    tune_key = build_tune_key(args=args, env_id=env_id, xml_path=xml_path, obs_dim=obs_dim, action_dim=action_dim)
-    tune_cache = load_tune_cache(args.tune_cache_path)
-    cached = tune_cache["entries"].get(tune_key)
-    if cached and (not args.ignore_tune_cache) and (not args.tune_before_train) and (not args.tune_only):
-        current_pairs = int(cached["pairs"])
-        current_chunk = int(cached["chunk"])
-        print(
-            f"[tune] loaded cached pairs/chunk {current_pairs}/{current_chunk} from {args.tune_cache_path}",
-            flush=True,
-        )
-
-    if args.tune_before_train or args.tune_only:
-        best, all_results = tune_shapes(build_evaluator=build_evaluator, theta=theta, args=args)
-        current_pairs = int(best["pairs"])
-        current_chunk = int(best["chunk"])
-        tune_cache["entries"][tune_key] = {
-            "pairs": current_pairs,
-            "chunk": current_chunk,
-            "throughput_median": float(best["throughput_median"]),
-            "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
-        }
-        save_tune_cache(args.tune_cache_path, tune_cache)
-        with open(os.path.join(run_dir, "tune_report.json"), "w") as f:
-            json.dump(
-                {
-                    "best": best,
-                    "results": all_results,
-                    "cache_path": args.tune_cache_path,
-                    "cache_key": tune_key,
-                },
-                f,
-                indent=2,
-            )
-        print(
-            f"[tune] selected pairs/chunk {current_pairs}/{current_chunk} "
-            f"(median_eps={float(best['throughput_median']):.1f})",
-            flush=True,
-        )
-        if args.tune_only:
-            logger.close()
-            return
+    current_pairs = FIXED_PAIRS
+    current_chunk = FIXED_CANDIDATE_CHUNK
 
     evaluator = build_evaluator(current_chunk)
     print(
@@ -1164,10 +1031,35 @@ def main() -> None:
         f"episodes/candidate={args.episodes_per_candidate}, envs={evaluator.num_envs}, pairs={current_pairs}",
         flush=True,
     )
-    print("[compile] warming JIT for selected shapes...", flush=True)
-    t_compile0 = time.perf_counter()
-    evaluator.evaluate_population(theta[None, :], seed_base=int(args.seed + 4242))
-    print(f"[compile] done in {time.perf_counter() - t_compile0:.1f}s", flush=True)
+    compile_key = build_compile_key(
+        args=args,
+        env_id=env_id,
+        xml_path=xml_path,
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        pairs=current_pairs,
+        chunk=current_chunk,
+    )
+    warmup_marker = os.path.join(compile_cache_dir, f"warmup_{compile_key}.json")
+    if os.path.exists(warmup_marker):
+        print(f"[compile] warmup already completed for fixed shape (marker: {warmup_marker})", flush=True)
+    else:
+        print("[compile] first-run warmup for fixed shape...", flush=True)
+        t_compile0 = time.perf_counter()
+        evaluator.evaluate_population(theta[None, :], seed_base=int(args.seed + 4242))
+        warmup_wall_s = time.perf_counter() - t_compile0
+        with open(warmup_marker, "w") as f:
+            json.dump(
+                {
+                    "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "pairs": current_pairs,
+                    "chunk": current_chunk,
+                    "warmup_wall_s": warmup_wall_s,
+                },
+                f,
+                indent=2,
+            )
+        print(f"[compile] warmup complete in {warmup_wall_s:.1f}s", flush=True)
 
     best_base_return = -float("inf")
     start = time.time()
