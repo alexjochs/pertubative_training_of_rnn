@@ -381,12 +381,6 @@ class CandidateEvaluator:
         self.num_envs = self.chunk_candidates * self.episodes_per_candidate
 
         self.model = mujoco.MjModel.from_xml_path(xml_path)
-        if int(self.model.ntendon) > 0:
-            raise RuntimeError(
-                "MJX does not support tendons for this stack. "
-                f"Loaded XML has ntendon={int(self.model.ntendon)}: {xml_path}. "
-                "Use tendonless humanoid XML (e.g. humanoid/humanoid.xml in this repo)."
-            )
         solver = int(self.model.opt.solver)
         solver_cg = int(mujoco.mjtSolver.mjSOL_CG)
         solver_newton = int(mujoco.mjtSolver.mjSOL_NEWTON)
@@ -440,10 +434,6 @@ class CandidateEvaluator:
 
         obs_variant = self.env_spec.obs_variant
         actuator_force_start = 6 if (obs_variant == "v5" and int(self.model.nv) - int(self.model.nu) == 6) else 0
-        cfrc_rows_target = (int(self.model.nbody) - 1) if obs_variant == "v5" else int(self.model.nbody)
-        cfrc_size_target = cfrc_rows_target * 6
-        actuator_size_target = int(self.model.nu) if obs_variant == "v5" else int(self.model.nv)
-        qfrc_full_size = max(int(self.model.nv), actuator_force_start + int(self.model.nu))
 
         C_full = self.chunk_candidates
         E = self.episodes_per_candidate
@@ -454,13 +444,6 @@ class CandidateEvaluator:
         nq = int(self.model.nq)
         nv = int(self.model.nv)
 
-        sample_data = mjx.make_data(self.mjx_model)
-        has_qfrc_actuator = hasattr(sample_data, "qfrc_actuator")
-        has_cfrc_ext = hasattr(sample_data, "cfrc_ext")
-        zeros_qfrc_full = jnp.zeros((qfrc_full_size,), dtype=jnp.float32)
-        zeros_actuator = jnp.zeros((actuator_size_target,), dtype=jnp.float32)
-        zeros_cfrc = jnp.zeros((cfrc_size_target,), dtype=jnp.float32)
-
         def mass_center_x(data: mjx.Data) -> jnp.ndarray:
             return jnp.sum(body_mass * data.xipos[:, 0]) / body_mass_sum
 
@@ -468,32 +451,16 @@ class CandidateEvaluator:
             position = data.qpos[2:]
             velocity = data.qvel
 
-            if has_qfrc_actuator:
-                qfrc_full = data.qfrc_actuator
-            else:
-                qfrc_full = zeros_qfrc_full
-
             if obs_variant == "v5":
                 com_inertia = data.cinert[1:].reshape((-1,))
                 com_velocity = data.cvel[1:].reshape((-1,))
-                if has_cfrc_ext:
-                    external_contact_forces = data.cfrc_ext[1:].reshape((-1,))
-                else:
-                    external_contact_forces = zeros_cfrc
-                actuator_forces = qfrc_full[actuator_force_start : actuator_force_start + actuator_size_target]
+                external_contact_forces = data.cfrc_ext[1:].reshape((-1,))
+                actuator_forces = data.qfrc_actuator[actuator_force_start:]
             else:
                 com_inertia = data.cinert.reshape((-1,))
                 com_velocity = data.cvel.reshape((-1,))
-                if has_cfrc_ext:
-                    external_contact_forces = data.cfrc_ext.reshape((-1,))
-                else:
-                    external_contact_forces = zeros_cfrc
-                actuator_forces = qfrc_full[:actuator_size_target]
-
-            if actuator_forces.shape[0] != actuator_size_target:
-                actuator_forces = zeros_actuator
-            if external_contact_forces.shape[0] != cfrc_size_target:
-                external_contact_forces = zeros_cfrc
+                external_contact_forces = data.cfrc_ext.reshape((-1,))
+                actuator_forces = data.qfrc_actuator
 
             obs = jnp.concatenate(
                 (
@@ -525,7 +492,7 @@ class CandidateEvaluator:
             forward_reward = forward_reward_weight * x_vel
             ctrl_cost = ctrl_cost_weight * jnp.sum(jnp.square(action))
 
-            if include_contact_cost and has_cfrc_ext:
+            if include_contact_cost:
                 contact_cost = contact_cost_weight * jnp.minimum(
                     jnp.sum(jnp.square(data.cfrc_ext)),
                     contact_cost_max,
