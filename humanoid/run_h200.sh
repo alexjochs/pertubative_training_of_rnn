@@ -140,6 +140,7 @@ PY
 # Optional preflight (compile-only):
 # python humanoid/pertubative_trained_rnn_rl.py \
 #     --env_candidates "Humanoid-v4" \
+#     --xml_path humanoid/humanoid.xml \
 #     --hidden 1024 \
 #     --rank 32 \
 #     --candidate_chunk 256 \
@@ -150,6 +151,7 @@ PY
 
 python humanoid/pertubative_trained_rnn_rl.py \
     --env_candidates "Humanoid-v4" \
+    --xml_path humanoid/humanoid.xml \
     --iters 10 \
     --pairs 4096 \
     --sigma 0.03 \
