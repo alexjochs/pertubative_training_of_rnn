@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=humanoid_mjx_test
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
+#SBATCH --output=humanoid/logs/%x_%j.out
+#SBATCH --error=humanoid/logs/%x_%j.err
 #SBATCH --partition=sy-grp
 #SBATCH --account=sy-grp
 #SBATCH --nodelist=cn-x-1
@@ -14,24 +14,12 @@
 
 set -euo pipefail
 
-START_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
-SEARCH_DIR="$(cd "$START_DIR" && pwd)"
-PROJECT_ROOT=""
+# Ensure we are in the repository root if submitted from the 'humanoid' folder
+if [[ "$PWD" == */humanoid ]]; then
+    cd ..
+fi
 
-for _ in 1 2 3 4 5 6; do
-  if [ -f "$SEARCH_DIR/humanoid/pertubative_trained_rnn_rl.py" ]; then
-    PROJECT_ROOT="$SEARCH_DIR"
-    break
-  fi
-  PARENT_DIR="$(dirname "$SEARCH_DIR")"
-  if [ "$PARENT_DIR" = "$SEARCH_DIR" ]; then
-    break
-  fi
-  SEARCH_DIR="$PARENT_DIR"
-done
-
-cd "$PROJECT_ROOT"
-mkdir -p "$PROJECT_ROOT/humanoid/logs"
+mkdir -p humanoid/logs
 
 echo "JobID: $SLURM_JOB_ID"
 echo "Node: $(hostname)"
