@@ -97,11 +97,26 @@ else
 fi
 
 # MJX stack for CUDA 12.x GPUs.
-# Use pinned wheel versions to avoid source builds on cluster nodes.
-python -m pip install --upgrade --only-binary=:all: \
-  "jax[cuda12]==0.4.30" \
-  "mujoco==3.1.6" \
-  "mujoco-mjx==3.1.6"
+# Try latest first; fall back to a known-compatible stack if wheels are unavailable
+# on this cluster image (common when glibc is older than manylinux_2_28 baseline).
+echo "glibc:"
+ldd --version | head -n 1 || true
+
+MJX_MUJOCO_VERSION="${MJX_MUJOCO_VERSION:-3.5.0}"
+MJX_FALLBACK_MUJOCO_VERSION="${MJX_FALLBACK_MUJOCO_VERSION:-3.1.6}"
+JAX_FALLBACK_VERSION="${JAX_FALLBACK_VERSION:-0.4.30}"
+
+echo "Installing MJX stack (preferred): mujoco/mujoco-mjx ${MJX_MUJOCO_VERSION}"
+if ! python -m pip install --upgrade --only-binary=:all: \
+    "jax[cuda12]" \
+    "mujoco==${MJX_MUJOCO_VERSION}" \
+    "mujoco-mjx==${MJX_MUJOCO_VERSION}"; then
+  echo "Preferred MJX stack install failed; falling back to mujoco/mujoco-mjx ${MJX_FALLBACK_MUJOCO_VERSION}"
+  python -m pip install --upgrade --only-binary=:all: \
+    "jax[cuda12]==${JAX_FALLBACK_VERSION}" \
+    "mujoco==${MJX_FALLBACK_MUJOCO_VERSION}" \
+    "mujoco-mjx==${MJX_FALLBACK_MUJOCO_VERSION}"
+fi
 
 python - <<'PY'
 import jax

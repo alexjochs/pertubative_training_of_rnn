@@ -387,6 +387,14 @@ class CandidateEvaluator:
                 f"Loaded XML has ntendon={int(self.model.ntendon)}: {xml_path}. "
                 "Use tendonless humanoid XML (e.g. humanoid/humanoid.xml in this repo)."
             )
+        solver = int(self.model.opt.solver)
+        solver_cg = int(mujoco.mjtSolver.mjSOL_CG)
+        solver_newton = int(mujoco.mjtSolver.mjSOL_NEWTON)
+        if solver not in (solver_cg, solver_newton):
+            raise RuntimeError(
+                "MJX supports solver=CG or solver=NEWTON for this stack. "
+                f"Loaded XML has solver={mujoco.mjtSolver(self.model.opt.solver)}: {xml_path}."
+            )
         self.mjx_model = mjx.put_model(self.model)
 
         if int(self.model.nu) != self.action_dim:
