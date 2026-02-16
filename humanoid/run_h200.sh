@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=humanoid_es
-#SBATCH --output=humanoid/logs/%x_%j.out
-#SBATCH --error=humanoid/logs/%x_%j.err
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
 #SBATCH --partition=sy-grp
 #SBATCH --account=sy-grp
 #SBATCH --nodelist=cn-x-1
@@ -14,10 +14,11 @@
 
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-mkdir -p humanoid/logs
+mkdir -p "$SCRIPT_DIR/logs"
 
 echo "JobID: $SLURM_JOB_ID"
 echo "Node: $(hostname)"
