@@ -381,6 +381,12 @@ class CandidateEvaluator:
         self.num_envs = self.chunk_candidates * self.episodes_per_candidate
 
         self.model = mujoco.MjModel.from_xml_path(xml_path)
+        if int(self.model.ntendon) > 0:
+            raise RuntimeError(
+                "MJX does not support tendons for this stack. "
+                f"Loaded XML has ntendon={int(self.model.ntendon)}: {xml_path}. "
+                "Use tendonless humanoid XML (e.g. humanoid/humanoid.xml in this repo)."
+            )
         self.mjx_model = mjx.put_model(self.model)
 
         if int(self.model.nu) != self.action_dim:

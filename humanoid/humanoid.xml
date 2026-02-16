@@ -88,17 +88,6 @@
             </body>
         </body>
     </worldbody>
-    <tendon>
-        <fixed name="left_hipknee">
-            <joint coef="-1" joint="left_hip_y"/>
-            <joint coef="1" joint="left_knee"/>
-        </fixed>
-        <fixed name="right_hipknee">
-            <joint coef="-1" joint="right_hip_y"/>
-            <joint coef="1" joint="right_knee"/>
-        </fixed>
-    </tendon>
-
     <actuator>
         <motor gear="100" joint="abdomen_y" name="abdomen_y"/>
         <motor gear="100" joint="abdomen_z" name="abdomen_z"/>
