@@ -19,7 +19,7 @@ SEARCH_DIR="$(cd "$START_DIR" && pwd)"
 PROJECT_ROOT=""
 
 for _ in 1 2 3 4 5 6; do
-  if [ -f "$SEARCH_DIR/requirements.txt" ] && [ -f "$SEARCH_DIR/humanoid/pertubative_trained_rnn_rl.py" ]; then
+  if [ -f "$SEARCH_DIR/humanoid/requirements_mjx.txt" ] && [ -f "$SEARCH_DIR/humanoid/pertubative_trained_rnn_rl.py" ]; then
     PROJECT_ROOT="$SEARCH_DIR"
     break
   fi
@@ -32,7 +32,7 @@ done
 
 if [ -z "$PROJECT_ROOT" ]; then
   echo "ERROR: Could not locate project root from START_DIR=$START_DIR"
-  echo "Expected files: requirements.txt and humanoid/pertubative_trained_rnn_rl.py"
+  echo "Expected files: humanoid/requirements_mjx.txt and humanoid/pertubative_trained_rnn_rl.py"
   exit 1
 fi
 
@@ -88,11 +88,11 @@ which python
 
 python -m pip install --upgrade pip setuptools wheel
 
-if [ -f "requirements.txt" ]; then
-  echo "Installing requirements.txt"
-  python -m pip install -r requirements.txt
+if [ -f "humanoid/requirements_mjx.txt" ]; then
+  echo "Installing humanoid/requirements_mjx.txt"
+  python -m pip install -r humanoid/requirements_mjx.txt
 else
-  echo "ERROR: requirements.txt not found in $(pwd)"
+  echo "ERROR: humanoid/requirements_mjx.txt not found in $(pwd)"
   exit 1
 fi
 
@@ -119,16 +119,23 @@ print("matmul check:", float(y[0, 0]))
 print("mjx module:", mjx.__name__)
 PY
 
-# Avoid CPU oversubscription and tell JAX to prefer GPU first.
+# Avoid CPU oversubscription and tell JAX to use CUDA on NVIDIA nodes.
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
-export JAX_PLATFORMS=gpu,cpu
+unset JAX_PLATFORMS
+export JAX_PLATFORM_NAME=cuda
 export XLA_PYTHON_CLIENT_PREALLOCATE=true
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.92
 
 # Headless MuJoCo defaults.
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
+
+python - <<'PY'
+import jax
+print("jax backend:", jax.default_backend())
+print("jax devices:", jax.devices())
+PY
 
 # Optional preflight (compile-only):
 # python humanoid/pertubative_trained_rnn_rl.py \
