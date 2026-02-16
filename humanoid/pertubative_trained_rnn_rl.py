@@ -17,9 +17,16 @@ import os
 import pickle
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, NamedTuple, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
+
+try:
+    import torch
+except Exception as exc:
+    raise RuntimeError(
+        "torch is required. Install with: pip install torch"
+    ) from exc
 
 try:
     import jax
@@ -215,12 +222,11 @@ class ReservoirPolicy:
     ):
         self.cfg = cfg
 
-        rng = np.random.default_rng(1234)
-        self.Win = jnp.asarray(
-            rng.standard_normal(size=(cfg.N, cfg.D), dtype=np.float32) * cfg.win_std,
-            dtype=jnp.float32,
-        )
-        self.b = jnp.zeros((cfg.N,), dtype=jnp.float32)
+        g = torch.Generator(device="cpu")
+        g.manual_seed(1234)
+        win_t = torch.randn((cfg.N, cfg.D), generator=g, dtype=torch.float32) * cfg.win_std
+        self.Win = jnp.asarray(win_t.numpy(), dtype=jnp.float32)
+        self.b = jnp.asarray(torch.zeros((cfg.N,), dtype=torch.float32).numpy(), dtype=jnp.float32)
         self.W0 = self._make_sparse_w0(cfg.N, cfg.k_in, w_std=cfg.w0_std)
 
         low = jnp.asarray(action_low, dtype=jnp.float32)
@@ -238,18 +244,20 @@ class ReservoirPolicy:
         print(f"  [Reservoir] Generating sparse W0 ({N}x{N})...", flush=True)
         t0 = time.time()
 
-        rng = np.random.default_rng(1234)
-        rows = np.repeat(np.arange(N, dtype=np.int32), k_in)
-        cols = rng.integers(0, N, size=N * k_in, endpoint=False, dtype=np.int32)
-        scale = w_std / math.sqrt(float(k_in))
-        vals = rng.standard_normal(size=N * k_in).astype(np.float32) * scale
+        g = torch.Generator(device="cpu")
+        g.manual_seed(1234)
 
-        dense = np.zeros((N, N), dtype=np.float32)
-        np.add.at(dense, (rows, cols), vals)
+        scale = w_std / math.sqrt(float(k_in))
+        rows = torch.arange(N, dtype=torch.long).repeat_interleave(k_in)
+        cols = torch.randint(0, N, (N * k_in,), generator=g, dtype=torch.long)
+        vals = torch.randn((N * k_in,), generator=g, dtype=torch.float32) * scale
+
+        idx = torch.stack([rows, cols], dim=0)
+        dense = torch.sparse_coo_tensor(idx, vals, (N, N), device="cpu").coalesce().to_dense()
 
         dt = time.time() - t0
         print(f"  [Reservoir] W0 generated in {dt:.2f}s", flush=True)
-        return jnp.asarray(dense, dtype=jnp.float32)
+        return jnp.asarray(dense.numpy(), dtype=jnp.float32)
 
     def split_theta(
         self, theta: jnp.ndarray
@@ -322,39 +330,8 @@ class ReservoirPolicy:
         return next_h, action, exploded
 
 
-class AdamState(NamedTuple):
-    m: jnp.ndarray
-    v: jnp.ndarray
-    t: jnp.ndarray
-
-
-def adam_init(theta: jnp.ndarray) -> AdamState:
-    return AdamState(
-        m=jnp.zeros_like(theta),
-        v=jnp.zeros_like(theta),
-        t=jnp.array(0, dtype=jnp.int32),
-    )
-
-
-def adam_step(
-    theta: jnp.ndarray,
-    grad: jnp.ndarray,
-    state: AdamState,
-    lr: float,
-    beta1: float = 0.9,
-    beta2: float = 0.999,
-    eps: float = 1e-8,
-) -> Tuple[jnp.ndarray, AdamState]:
-    t = state.t + 1
-    m = beta1 * state.m + (1.0 - beta1) * grad
-    v = beta2 * state.v + (1.0 - beta2) * (grad * grad)
-
-    t_f = t.astype(jnp.float32)
-    m_hat = m / (1.0 - jnp.power(beta1, t_f))
-    v_hat = v / (1.0 - jnp.power(beta2, t_f))
-
-    theta_next = theta - lr * m_hat / (jnp.sqrt(v_hat) + eps)
-    return theta_next, AdamState(m=m, v=v, t=t)
+def torch_to_jnp(x: torch.Tensor) -> jnp.ndarray:
+    return jnp.asarray(x.detach().cpu().numpy(), dtype=jnp.float32)
 
 
 class CandidateEvaluator:
@@ -705,13 +682,18 @@ class CandidateEvaluator:
 def save_checkpoint(
     path: str,
     iteration: int,
-    theta: jnp.ndarray,
+    theta: Any,
     args: argparse.Namespace,
     extra: Dict[str, float],
 ) -> None:
+    if isinstance(theta, torch.Tensor):
+        theta_np = theta.detach().cpu().numpy().astype(np.float32)
+    else:
+        theta_np = np.asarray(theta, dtype=np.float32)
+
     payload = {
         "iter": int(iteration),
-        "theta": np.asarray(theta, dtype=np.float32),
+        "theta": theta_np,
         "args": vars(args),
         "extra": extra,
     }
@@ -876,7 +858,7 @@ def parse_args() -> argparse.Namespace:
         "--torch_num_threads",
         type=int,
         default=4,
-        help="Deprecated compatibility flag; ignored in MJX mode.",
+        help="CPU threads used by Torch (reservoir init + optimizer math).",
     )
     parser.add_argument(
         "--compile_cache_dir",
@@ -914,7 +896,11 @@ def main() -> None:
     args.candidate_chunk = FIXED_CANDIDATE_CHUNK
 
     np.random.seed(args.seed)
-    rng = jax.random.PRNGKey(args.seed)
+    torch.manual_seed(args.seed)
+    if int(args.torch_num_threads) > 0:
+        torch.set_num_threads(int(args.torch_num_threads))
+    torch_gen = torch.Generator(device="cpu")
+    torch_gen.manual_seed(args.seed)
 
     devices = jax.devices()
     print("JAX devices:", [f"{d.platform}:{d.id}" for d in devices], flush=True)
@@ -995,19 +981,17 @@ def main() -> None:
 
     policy = ReservoirPolicy(cfg, action_low=action_low, action_high=action_high)
 
-    theta = jnp.zeros((policy.theta_dim,), dtype=jnp.float32)
+    theta = torch.zeros((policy.theta_dim,), dtype=torch.float32, device="cpu")
+    theta.requires_grad_(True)
 
     # Initialize action head with small random values for non-degenerate startup.
     n, r, a = cfg.N, cfg.rank, cfg.A
     uv = 2 * n * r
     wa = a * n
-    rng, k_action = jax.random.split(rng)
-    theta = theta.at[uv : uv + wa].set(
-        args.init_action_std * jax.random.normal(k_action, shape=(wa,), dtype=jnp.float32)
-    )
-    theta = theta.at[uv + wa : uv + wa + a].set(jnp.zeros((a,), dtype=jnp.float32))
-
-    adam_state = adam_init(theta)
+    with torch.no_grad():
+        theta[uv : uv + wa] = args.init_action_std * torch.randn((wa,), generator=torch_gen, dtype=torch.float32)
+        theta[uv + wa : uv + wa + a] = 0.0
+    theta_optimizer = torch.optim.Adam([theta], lr=args.theta_lr)
 
     def build_evaluator(chunk_candidates: int) -> CandidateEvaluator:
         return CandidateEvaluator(
@@ -1046,7 +1030,8 @@ def main() -> None:
     else:
         print("[compile] first-run warmup for fixed shape...", flush=True)
         t_compile0 = time.perf_counter()
-        evaluator.evaluate_population(theta[None, :], seed_base=int(args.seed + 4242))
+        theta_jnp = torch_to_jnp(theta)
+        evaluator.evaluate_population(theta_jnp[None, :], seed_base=int(args.seed + 4242))
         warmup_wall_s = time.perf_counter() - t_compile0
         with open(warmup_marker, "w") as f:
             json.dump(
@@ -1073,18 +1058,18 @@ def main() -> None:
             K = int(current_pairs)
             iter_pairs = int(K)
             iter_chunk = int(current_chunk)
-            theta_dim = int(theta.shape[0])
+            theta_dim = int(theta.numel())
 
-            rng, eps_key = jax.random.split(rng)
-            epsilon = jax.random.normal((eps_key), shape=(K, theta_dim), dtype=jnp.float32)
-            theta_view = theta[None, :]
-            pop_theta = jnp.concatenate(
+            theta_view = theta.detach().unsqueeze(0)
+            epsilon = torch.randn((K, theta_dim), generator=torch_gen, dtype=torch.float32)
+            pop_theta_t = torch.cat(
                 [
                     theta_view + args.sigma * epsilon,
                     theta_view - args.sigma * epsilon,
                 ],
-                axis=0,
+                dim=0,
             )
+            pop_theta = torch_to_jnp(pop_theta_t)
 
             cand_returns_np, cand_lengths_np, cand_exploded_np, eval_stats = evaluator.evaluate_population(
                 pop_theta,
@@ -1093,16 +1078,19 @@ def main() -> None:
 
             cand_returns = jnp.asarray(cand_returns_np, dtype=jnp.float32)
             fitness = rank_transform(cand_returns, maximize=True)
-            w_pos = fitness[:K]
-            w_neg = fitness[K:]
-
-            grad_est = ((w_pos[:, None] - w_neg[:, None]) * epsilon).mean(axis=0)
-            theta, adam_state = adam_step(theta, grad=-grad_est, state=adam_state, lr=args.theta_lr)
+            fitness_t = torch.from_numpy(np.asarray(fitness, dtype=np.float32))
+            w_pos = fitness_t[:K, None]
+            w_neg = fitness_t[K:, None]
+            grad_est = ((w_pos - w_neg) * epsilon).mean(dim=0)
+            theta_optimizer.zero_grad(set_to_none=True)
+            theta.grad = -grad_est
+            theta_optimizer.step()
 
             base_return = float("nan")
             if iteration % args.log_every == 0 or iteration == 1:
+                theta_jnp = torch_to_jnp(theta)
                 base_ret_np, _, _, base_stats = evaluator.evaluate_population(
-                    theta[None, :],
+                    theta_jnp[None, :],
                     seed_it + 777,
                 )
                 base_return = float(base_ret_np[0])
@@ -1124,7 +1112,7 @@ def main() -> None:
             cand_max = float(np.max(cand_returns_np))
             bad_frac = float(np.mean(cand_exploded_np.astype(np.float32)))
             mean_ep_len = float(np.mean(cand_lengths_np))
-            theta_norm = float(np.linalg.norm(np.asarray(theta)))
+            theta_norm = float(theta.detach().norm().item())
 
             cand_per_sec = float((2 * K) / max(float(eval_stats["wall_s"]), 1e-9))
 

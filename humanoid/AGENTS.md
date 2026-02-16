@@ -14,6 +14,7 @@ It should use its own environment and dependency path, separate from the root pe
 - `jax[cuda12]==0.9.0.1`
 - `mujoco==3.5.0`
 - `mujoco-mjx==3.5.0`
+- `torch` (used for reservoir init and ES optimizer math)
 - Installed in `humanoid/run_h200.sh` with `--only-binary=:all:`
 
 ## Environment Variables (important)
