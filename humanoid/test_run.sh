@@ -1,40 +1,85 @@
 #!/bin/bash
-#SBATCH --job-name=humanoid_test
-#SBATCH --output=logs/%j.out
-#SBATCH --error=logs/%j.err
+#SBATCH --job-name=humanoid_mjx_test
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
 #SBATCH --partition=sy-grp
 #SBATCH --account=sy-grp
 #SBATCH --nodelist=cn-x-1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=128
 #SBATCH --gres=gpu:1
-#SBATCH --mem=64G
+#SBATCH --mem=100G
 #SBATCH --time=00:30:00
 
-# === ASSUMPTIONS ===
-# 1. Run this from: `~/hpc-share/scratch_repos/pertubative_training_of_rnn/humanoid`
-# 2. It will create/use a venv at `../.venv_mjx`
-# 3. It installs JAX/MJX/MuJoCo specific to CUDA 12.8 on the nodes.
-
 set -euo pipefail
-mkdir -p logs
 
-# 1. Load Cluster Modules
+START_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
+SEARCH_DIR="$(cd "$START_DIR" && pwd)"
+PROJECT_ROOT=""
+
+for _ in 1 2 3 4 5 6; do
+  if [ -f "$SEARCH_DIR/humanoid/requirements_mjx.txt" ] && [ -f "$SEARCH_DIR/humanoid/pertubative_trained_rnn_rl.py" ]; then
+    PROJECT_ROOT="$SEARCH_DIR"
+    break
+  fi
+  PARENT_DIR="$(dirname "$SEARCH_DIR")"
+  if [ "$PARENT_DIR" = "$SEARCH_DIR" ]; then
+    break
+  fi
+  SEARCH_DIR="$PARENT_DIR"
+done
+
+cd "$PROJECT_ROOT"
+mkdir -p "$PROJECT_ROOT/humanoid/logs"
+
+echo "JobID: $SLURM_JOB_ID"
+echo "Node: $(hostname)"
+echo "CWD:  $(pwd)"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"
+
 module purge
 module load cuda/12.8
 
-# 2. Setup/Activate Venv (using a dedicated mjx venv to avoid conflicts)
-VENV_PATH="../.venv_mjx"
-if [ ! -d "$VENV_PATH" ]; then
-    echo "Creating new MJX environment..."
-    python3 -m venv "$VENV_PATH"
+if [ -z "${PYTHON_BIN:-}" ]; then
+  for candidate in python3.11 python3.10 python3; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      PYTHON_BIN="$candidate"
+      break
+    fi
+  done
 fi
-source "$VENV_PATH/bin/activate"
 
-# 3. Install Dependencies (The "Working" Stack)
-echo "Ensuring JAX/MJX stack is installed..."
+PY_VER="$($PYTHON_BIN - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)"
+VENV_DIR=".venv_py${PY_VER/./}"
+
+echo "Selected Python: $PYTHON_BIN ($PY_VER)"
+echo "Using venv: $VENV_DIR"
+
+if [ ! -d "$VENV_DIR" ]; then
+  echo "Creating venv at $VENV_DIR"
+  $PYTHON_BIN -m venv "$VENV_DIR"
+fi
+
+source "$VENV_DIR/bin/activate"
+python -V
+which python
+
 python -m pip install --upgrade pip setuptools wheel
+
+if [ -f "humanoid/requirements_mjx.txt" ]; then
+  echo "Installing humanoid/requirements_mjx.txt"
+  python -m pip install -r humanoid/requirements_mjx.txt
+else
+  echo "ERROR: humanoid/requirements_mjx.txt not found in $(pwd)"
+  exit 1
+fi
+
+# MJX stack for CUDA 12.x GPUs (validated on this cluster).
 python -m pip install --upgrade --only-binary=:all: \
   "jax[cuda12]==0.9.0.1" \
   "mujoco==3.5.0" \
@@ -42,15 +87,28 @@ python -m pip install --upgrade --only-binary=:all: \
   "torch" \
   "numpy"
 
-# 4. Verify the stack before running
-python -c "import jax; import mujoco; print(f'JAX: {jax.devices()}'); print('MuJoCo Loaded Successfully')"
+# Avoid CPU oversubscription and tell JAX to use CUDA on NVIDIA nodes.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+unset JAX_PLATFORMS
+export JAX_PLATFORM_NAME=cuda
+export JAX_LOG_COMPILES=1
+export XLA_PYTHON_CLIENT_PREALLOCATE=true
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.92
 
-# 5. Run the Training Script
-# env.py, model.py, etc. are in the current folder, so we run direct.
-python pertubative_trained_rnn_rl.py \
+# Headless MuJoCo defaults.
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+
+python humanoid/pertubative_trained_rnn_rl.py \
+    --env_candidates "Humanoid-v4" \
+    --xml_path humanoid/humanoid.xml \
     --iters 5 \
     --hidden 256 \
     --pairs 32 \
-    --results_root test_results
+    --episodes_per_candidate 1 \
+    --rollout_steps 100 \
+    --log_every 1 \
+    --results_root humanoid/test_results
 
-echo "Run complete. Check humanoid/logs/ and humanoid/test_results/"
+echo "Humanoid MJX perturbative RL test complete."

@@ -39,13 +39,9 @@ It should use its own environment and dependency path, separate from the root pe
 - These are optional acceleration backends; not required for JAX+MJX GPU execution.
 
 ## Run Path
-- Primary launcher:
-  - `humanoid/run_h200.sh`
-- It installs:
-  - `humanoid/requirements_mjx.txt` (minimal base deps)
-  - then pinned MJX/JAX stack
-- Training entrypoint:
-  - `humanoid/pertubative_trained_rnn_rl.py`
+- **Primary launcher**: `humanoid/run_h200.sh`
+- **Critical Boilerplate**: Any new batch script **MUST** copy the `run_h200.sh` boilerplate for Python probing (3.11 check), venv creation, and library pins. DO NOT simplify the environment setup; it is fragile on this cluster.
+- **Entrypoint**: `humanoid/pertubative_trained_rnn_rl.py`
 
 ## Fixed Runtime Shape
 - Runtime shape is fixed:
@@ -63,6 +59,31 @@ It should use its own environment and dependency path, separate from the root pe
   - Ensure `JAX_PLATFORM_NAME=cuda` and `JAX_PLATFORMS` unset.
 - MuJoCo source build attempts:
   - Keep wheel-only installs and pinned versions in `run_h200.sh`.
+
+## Cluster Submission Guide
+
+### 1. Directory Assumptions
+- **Submit Site**: Always run `sbatch` from within the `humanoid/` directory.
+- **Log Location**: Slurm will write `.out` and `.err` files to `humanoid/logs/`.
+- **Imports**: Running from `humanoid/` ensures Python finds `env.py`, `model.py`, and `utils.py` as local imports.
+
+### 2. How to Run
+```bash
+cd humanoid/
+sbatch test_run.sh   # For quick verification (5 iters, 32 pairs)
+sbatch run_h200.sh   # For production training (100 iters, 8192 pairs)
+```
+
+### 3. Environment Setup (Automatic in SBATCH)
+The scripts handle the following automatically:
+- **Modules**: `module load cuda/12.8`
+- **Venv**: Creates/Uses `../.venv_mjx` (stored in Repo Root).
+- **Versioning**: Pins `jax[cuda12]==0.9.0.1` and `mujoco==3.5.0` to match the cluster CUDA version.
+
+### 4. Verifying Success
+1. Check `humanoid/logs/` for the latest `.out` file. 
+2. Verify JAX output: `jax devices: [gpu(id=0)]`.
+3. Training metrics appear in `humanoid/results/` (or `test_results/` for the test script).
 
 ## Coordination Notes
 - Keep changes in this folder isolated from root project training unless explicitly requested.
