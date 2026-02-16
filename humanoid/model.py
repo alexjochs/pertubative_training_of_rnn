@@ -29,6 +29,11 @@ class ReservoirPolicy:
         self.b = jnp.zeros(cfg.N)
         self.W0 = self._make_sparse_w0(cfg.N, cfg.k_in, cfg.w0_std)
 
+    @property
+    def theta_dim(self) -> int:
+        n, r, a = self.cfg.N, self.cfg.rank, self.cfg.A
+        return 2 * n * r + a * n + a
+
     def _make_sparse_w0(self, N, k_in, w_std):
         key = jax.random.PRNGKey(1234)
         scale = w_std / (k_in**0.5)
