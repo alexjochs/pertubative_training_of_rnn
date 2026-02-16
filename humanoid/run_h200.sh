@@ -14,6 +14,23 @@
 
 set -euo pipefail
 
+RUN_MODE="train"
+for arg in "$@"; do
+  case "$arg" in
+    --tune-only)
+      RUN_MODE="tune_only"
+      ;;
+    --train-only)
+      RUN_MODE="train"
+      ;;
+    *)
+      echo "Unknown argument: $arg"
+      echo "Usage: sbatch humanoid/run_h200.sh [--tune-only|--train-only]"
+      exit 2
+      ;;
+  esac
+done
+
 START_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 SEARCH_DIR="$(cd "$START_DIR" && pwd)"
 PROJECT_ROOT=""
@@ -137,17 +154,17 @@ print("jax backend:", jax.default_backend())
 print("jax devices:", jax.devices())
 PY
 
-# Optional preflight (compile-only):
+# Optional tuning-only pass (writes/updates tune cache, does not train):
 # python humanoid/pertubative_trained_rnn_rl.py \
 #     --env_candidates "Humanoid-v4" \
 #     --xml_path humanoid/humanoid.xml \
+#     --pairs 4096 \
 #     --hidden 1024 \
 #     --rank 32 \
 #     --candidate_chunk 256 \
 #     --episodes_per_candidate 2 \
 #     --rollout_steps 500 \
-#     --dry_run_compile \
-#     --dry_run_repeats 2
+#     --tune_only
 
 python humanoid/pertubative_trained_rnn_rl.py \
     --env_candidates "Humanoid-v4" \
@@ -163,12 +180,13 @@ python humanoid/pertubative_trained_rnn_rl.py \
     --episodes_per_candidate 2 \
     --candidate_chunk 256 \
     --rollout_steps 500 \
-    --autotune_warmup_iters 3 \
-    --autotune_pairs_cap 32768 \
-    --autotune_chunk_cap 1024 \
     --log_every 1 \
     --checkpoint_every 1 \
-    --headroom_target_iter_sec 600 \
-    --results_root humanoid/results
+    --results_root humanoid/results \
+    $([ "$RUN_MODE" = "tune_only" ] && echo "--tune_only")
 
-echo "Humanoid MJX perturbative RL training complete."
+if [ "$RUN_MODE" = "tune_only" ]; then
+  echo "Humanoid MJX tuning-only run complete."
+else
+  echo "Humanoid MJX perturbative RL training complete."
+fi

@@ -46,11 +46,18 @@ It should use its own environment and dependency path, separate from the root pe
 - Training entrypoint:
   - `humanoid/pertubative_trained_rnn_rl.py`
 
-## Useful Debug Flags
-- Dry compile sanity:
-  - `--dry_run_compile --dry_run_repeats 2`
-- Warmup autotune (already used in run script):
-  - `--autotune_warmup_iters 3`
+## Tuning Workflow
+- Correct flow is explicit and two-phase:
+  1) run tuning pass (`--tune_only`) to benchmark `(pairs, chunk)` on steady-state runtime.
+  2) train with fixed tuned values loaded from cache.
+- Cache path:
+  - `humanoid/mjx_tune_cache.json`
+- Useful flags:
+  - `--tune_only`
+  - `--tune_before_train`
+  - `--ignore_tune_cache`
+  - `--tune_pairs_grid "2048,4096,8192"`
+  - `--tune_chunk_grid "128,256,512"`
 
 ## Known Failure Patterns and Fix Direction
 - `NotImplementedError: mjtSolver.mjSOL_PGS`

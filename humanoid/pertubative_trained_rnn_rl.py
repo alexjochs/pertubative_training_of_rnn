@@ -10,13 +10,14 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime
+import hashlib
 import json
 import math
 import os
 import pickle
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, NamedTuple, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Tuple
 
 import numpy as np
 
@@ -85,9 +86,6 @@ class CSVLogger:
 def make_eval_stats() -> Dict[str, Any]:
     return {
         "wall_s": 0.0,
-        "policy_s": 0.0,
-        "env_s": 0.0,
-        "tensor_s": 0.0,
         "chunks": 0,
         "loop_steps": 0,
         "effective_env_steps": 0,
@@ -96,7 +94,7 @@ def make_eval_stats() -> Dict[str, Any]:
 
 
 def merge_eval_stats(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
-    for key in ("wall_s", "policy_s", "env_s", "tensor_s"):
+    for key in ("wall_s",):
         dst[key] += float(src[key])
     for key in ("chunks", "loop_steps", "effective_env_steps", "actual_env_steps"):
         dst[key] += int(src[key])
@@ -547,69 +545,77 @@ class CandidateEvaluator:
             alive = jnp.ones((C_full, E), dtype=jnp.bool_)
             exploded_by_candidate = jnp.zeros((C_full,), dtype=jnp.bool_)
 
-            def scan_step(carry, step_idx):
-                h, data, obs, returns, lengths, alive, exploded_by_candidate = carry
+            def cond_fn(carry):
+                step_idx = carry[0]
+                alive = carry[6]
+                return (step_idx < self.rollout_steps) & jnp.any(alive)
+
+            def body_fn(carry):
+                step_idx, h, data, obs, returns, lengths, alive, exploded_by_candidate, eff_steps, loop_steps = carry
                 active_count = jnp.sum(alive.astype(jnp.int32))
 
-                def active_branch(_):
-                    alive_mask = alive[..., None].astype(jnp.float32)
-                    h_live = h * alive_mask
+                alive_mask = alive[..., None].astype(jnp.float32)
+                h_live = h * alive_mask
 
-                    h_next, action, exploded = self.policy.policy_step(
-                        h_live,
-                        obs,
-                        cand_U,
-                        cand_V,
-                        cand_Wa,
-                        cand_ba,
-                    )
+                h_next, action, exploded = self.policy.policy_step(
+                    h_live,
+                    obs,
+                    cand_U,
+                    cand_V,
+                    cand_Wa,
+                    cand_ba,
+                )
 
-                    exploded_by_candidate_next = exploded_by_candidate | jnp.any(exploded, axis=1)
-                    h_next = jnp.where(exploded[..., None], 0.0, h_next)
+                exploded_by_candidate_next = exploded_by_candidate | jnp.any(exploded, axis=1)
+                h_next = jnp.where(exploded[..., None], 0.0, h_next)
 
-                    action_flat = action.reshape((B, A))
-                    data_next, obs_next_flat, reward_flat, terminated_flat = jax.vmap(step_env)(
-                        data,
-                        action_flat,
-                    )
+                action_flat = action.reshape((B, A))
+                data_next, obs_next_flat, reward_flat, terminated_flat = jax.vmap(step_env)(
+                    data,
+                    action_flat,
+                )
 
-                    obs_next = obs_next_flat.reshape((C_full, E, D))
-                    reward = reward_flat.reshape((C_full, E))
-                    terminated = terminated_flat.reshape((C_full, E))
+                obs_next = obs_next_flat.reshape((C_full, E, D))
+                reward = reward_flat.reshape((C_full, E))
+                terminated = terminated_flat.reshape((C_full, E))
 
-                    returns_next = returns + jnp.where(alive, reward, 0.0)
-                    newly_done = alive & terminated
-                    lengths_next = jnp.where(newly_done, step_idx + 1, lengths)
-                    alive_next = alive & (~terminated)
+                returns_next = returns + jnp.where(alive, reward, 0.0)
+                newly_done = alive & terminated
+                lengths_next = jnp.where(newly_done, step_idx + 1, lengths)
+                alive_next = alive & (~terminated)
 
-                    return (
-                        h_next,
-                        data_next,
-                        obs_next,
-                        returns_next,
-                        lengths_next,
-                        alive_next,
-                        exploded_by_candidate_next,
-                    )
+                return (
+                    step_idx + 1,
+                    h_next,
+                    data_next,
+                    obs_next,
+                    returns_next,
+                    lengths_next,
+                    alive_next,
+                    exploded_by_candidate_next,
+                    eff_steps + active_count,
+                    loop_steps + jnp.array(1, dtype=jnp.int32),
+                )
 
-                carry_next = jax.lax.cond(active_count > 0, active_branch, lambda _: carry, operand=None)
-                loop_inc = jnp.where(active_count > 0, 1, 0).astype(jnp.int32)
-                return carry_next, (active_count, loop_inc)
-
-            carry0 = (h, data, obs, returns, lengths, alive, exploded_by_candidate)
-            carry_f, (active_counts, loop_incs) = jax.lax.scan(
-                scan_step,
-                carry0,
-                jnp.arange(self.rollout_steps, dtype=jnp.int32),
+            carry0 = (
+                jnp.array(0, dtype=jnp.int32),
+                h,
+                data,
+                obs,
+                returns,
+                lengths,
+                alive,
+                exploded_by_candidate,
+                jnp.array(0, dtype=jnp.int32),
+                jnp.array(0, dtype=jnp.int32),
             )
+            carry_f = jax.lax.while_loop(cond_fn, body_fn, carry0)
 
-            _, _, _, returns_f, lengths_f, alive_f, exploded_f = carry_f
+            _, _, _, _, returns_f, lengths_f, alive_f, exploded_f, effective_env_steps, loop_steps = carry_f
             lengths_f = jnp.where(alive_f, self.rollout_steps, lengths_f)
 
             returns_c = jnp.mean(returns_f, axis=1)
             lengths_c = jnp.mean(lengths_f.astype(jnp.float32), axis=1)
-            effective_env_steps = jnp.sum(active_counts)
-            loop_steps = jnp.sum(loop_incs)
             actual_env_steps = loop_steps * B
 
             return returns_c, lengths_c, exploded_f, effective_env_steps, actual_env_steps, loop_steps
@@ -759,117 +765,173 @@ def get_gpu_stats() -> Dict[str, float]:
     return out
 
 
-def _round_to_step(value: int, step: int, min_value: int, max_value: int) -> int:
-    step = max(1, int(step))
-    value = int(round(float(value) / float(step)) * step)
-    value = max(int(min_value), value)
-    value = min(int(max_value), value)
-    return int(value)
+def file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
-def run_dry_compile_check(
-    evaluator: CandidateEvaluator,
+def load_tune_cache(path: str) -> Dict[str, Any]:
+    if not path or not os.path.exists(path):
+        return {"version": 1, "entries": {}}
+    with open(path, "r") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        return {"version": 1, "entries": {}}
+    entries = data.get("entries", {})
+    if not isinstance(entries, dict):
+        entries = {}
+    return {"version": 1, "entries": entries}
+
+
+def save_tune_cache(path: str, cache: Dict[str, Any]) -> None:
+    if not path:
+        return
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(cache, f, indent=2)
+
+
+def parse_int_grid(spec: str, fallback: List[int]) -> List[int]:
+    if spec.strip():
+        vals = [int(x.strip()) for x in spec.split(",") if x.strip()]
+    else:
+        vals = list(fallback)
+    vals = sorted(set(v for v in vals if int(v) > 0))
+    if not vals:
+        raise RuntimeError("Tuning grid is empty.")
+    return vals
+
+
+def benchmark_shape(
+    build_evaluator: Callable[[int], CandidateEvaluator],
     theta: jnp.ndarray,
-    seed_base: int,
-    repeats: int,
-) -> Dict[str, Any]:
-    repeats = max(1, int(repeats))
-    C = int(evaluator.chunk_candidates)
-    theta_batch = jnp.repeat(theta[None, :], repeats=C, axis=0)
-
-    entries: List[Dict[str, float]] = []
-    for i in range(repeats):
-        t0 = time.perf_counter()
-        _, _, _, stats = evaluator.evaluate_chunk(theta_batch, seed_base=seed_base + i * 17)
-        wall = time.perf_counter() - t0
-        eff = int(stats["effective_env_steps"])
-        fps = float(eff / max(wall, 1e-9))
-        entries.append(
-            {
-                "run_idx": float(i + 1),
-                "wall_s": float(wall),
-                "effective_env_steps": float(eff),
-                "effective_fps": float(fps),
-            }
-        )
-
-    gpu = get_gpu_stats()
-    return {"runs": entries, "gpu": gpu}
-
-
-def propose_autotuned_batch_sizes(
     pairs: int,
     chunk: int,
-    iter_elapsed: float,
-    gpu_used_frac: float,
-    gpu_peak_reserved_frac: float,
+    sigma: float,
+    seed: int,
+    repeats: int,
+    burnin: int,
+) -> Dict[str, float]:
+    repeats = max(1, int(repeats))
+    burnin = max(0, int(burnin))
+    theta_dim = int(theta.shape[0])
+    evaluator = build_evaluator(chunk)
+    rates: List[float] = []
+    walls: List[float] = []
+    try:
+        for i in range(burnin + repeats):
+            key = jax.random.PRNGKey(int(seed + i * 97))
+            eps = jax.random.normal(key, shape=(pairs, theta_dim), dtype=jnp.float32)
+            theta_view = theta[None, :]
+            pop_theta = jnp.concatenate([theta_view + sigma * eps, theta_view - sigma * eps], axis=0)
+            _, _, _, stats = evaluator.evaluate_population(pop_theta, seed_base=int(seed + i * 100_003))
+            if i >= burnin:
+                wall_s = float(stats["wall_s"])
+                eff_steps = float(stats["effective_env_steps"])
+                walls.append(wall_s)
+                rates.append(eff_steps / max(wall_s, 1e-9))
+    finally:
+        evaluator.close()
+
+    gpu = get_gpu_stats()
+    return {
+        "pairs": float(pairs),
+        "chunk": float(chunk),
+        "throughput_median": float(np.median(np.asarray(rates, dtype=np.float64))),
+        "throughput_mean": float(np.mean(np.asarray(rates, dtype=np.float64))),
+        "wall_mean_s": float(np.mean(np.asarray(walls, dtype=np.float64))),
+        "gpu_peak_reserved_frac": float(gpu["gpu_peak_reserved_frac"]),
+        "gpu_peak_reserved_gb": float(gpu["gpu_peak_reserved_gb"]),
+    }
+
+
+def tune_shapes(
+    build_evaluator: Callable[[int], CandidateEvaluator],
+    theta: jnp.ndarray,
     args: argparse.Namespace,
-) -> Tuple[int, int, List[str]]:
-    notes: List[str] = []
-
-    target_iter = max(float(args.headroom_target_iter_sec), 1e-6)
-    min_scale = max(0.1, float(args.autotune_min_scale))
-    max_scale = max(min_scale, float(args.autotune_max_scale))
-
-    time_scale = target_iter / max(iter_elapsed, 1e-6)
-    time_scale = float(np.clip(time_scale, min_scale, max_scale))
-    notes.append(f"time_scale={time_scale:.2f}")
-
-    mem_scale = 1.0
-    if np.isfinite(gpu_peak_reserved_frac) and gpu_peak_reserved_frac > 1e-6:
-        mem_scale = float(args.autotune_peak_reserved_target) / float(gpu_peak_reserved_frac)
-        mem_scale = float(np.clip(mem_scale, min_scale, max_scale))
-        notes.append(f"mem_scale={mem_scale:.2f}")
-    else:
-        notes.append("mem_scale=n/a")
-
-    util_scale = 1.0
-    if np.isfinite(gpu_used_frac):
-        low = float(args.autotune_gpu_used_target) * 0.70
-        high = min(0.995, float(args.autotune_gpu_used_target) * 1.10)
-        if gpu_used_frac < low:
-            util_scale = 1.15
-        elif gpu_used_frac > high:
-            util_scale = 0.85
-        notes.append(f"util_scale={util_scale:.2f}")
-    else:
-        notes.append("util_scale=n/a")
-
-    pair_scale = time_scale * util_scale * math.sqrt(max(1e-6, mem_scale))
-    pair_scale = float(np.clip(pair_scale, min_scale, max_scale))
-
-    chunk_scale = mem_scale
-    if iter_elapsed > target_iter * 1.15:
-        chunk_scale = min(chunk_scale, 1.0)
-    elif iter_elapsed < target_iter * 0.75 and np.isfinite(gpu_used_frac):
-        if gpu_used_frac < float(args.autotune_gpu_used_target):
-            chunk_scale = max(chunk_scale, 1.10)
-    chunk_scale = float(np.clip(chunk_scale, min_scale, max_scale))
-
-    next_pairs = _round_to_step(
-        int(round(float(pairs) * pair_scale)),
-        step=int(args.autotune_pairs_step),
-        min_value=1,
-        max_value=max(1, int(args.autotune_pairs_cap)),
+) -> Tuple[Dict[str, float], List[Dict[str, float]]]:
+    pairs_grid = parse_int_grid(
+        args.tune_pairs_grid,
+        [max(64, args.pairs // 2), args.pairs, args.pairs * 2],
     )
-    next_chunk = _round_to_step(
-        int(round(float(chunk) * chunk_scale)),
-        step=int(args.autotune_chunk_step),
-        min_value=1,
-        max_value=max(1, int(args.autotune_chunk_cap)),
+    chunk_grid = parse_int_grid(
+        args.tune_chunk_grid,
+        [max(16, args.candidate_chunk // 2), args.candidate_chunk, args.candidate_chunk * 2],
     )
 
-    # Keep chunk bounded by total candidate count to avoid needless over-padding.
-    next_chunk = min(next_chunk, max(1, 2 * next_pairs))
+    results: List[Dict[str, float]] = []
+    print(f"[tune] pairs grid: {pairs_grid}", flush=True)
+    print(f"[tune] chunk grid: {chunk_grid}", flush=True)
 
-    if abs(next_pairs - pairs) < max(int(args.autotune_pairs_step), int(0.05 * max(1, pairs))):
-        next_pairs = int(pairs)
-    if abs(next_chunk - chunk) < max(int(args.autotune_chunk_step), int(0.05 * max(1, chunk))):
-        next_chunk = int(chunk)
+    for chunk in chunk_grid:
+        for pairs in pairs_grid:
+            print(f"[tune] testing pairs={pairs}, chunk={chunk}", flush=True)
+            try:
+                r = benchmark_shape(
+                    build_evaluator=build_evaluator,
+                    theta=theta,
+                    pairs=pairs,
+                    chunk=chunk,
+                    sigma=args.sigma,
+                    seed=args.seed + 91_337,
+                    repeats=args.tune_repeats,
+                    burnin=args.tune_burnin,
+                )
+            except Exception as exc:
+                print(f"[tune] failed pairs={pairs}, chunk={chunk}: {exc}", flush=True)
+                continue
 
-    notes.append(f"pair_scale={pair_scale:.2f}")
-    notes.append(f"chunk_scale={chunk_scale:.2f}")
-    return int(next_pairs), int(next_chunk), notes
+            peak_frac = float(r["gpu_peak_reserved_frac"])
+            if np.isfinite(peak_frac) and peak_frac > float(args.tune_peak_reserved_max):
+                print(
+                    f"[tune] reject pairs={pairs}, chunk={chunk} due to peak_reserved_frac={peak_frac:.3f}",
+                    flush=True,
+                )
+                continue
+
+            print(
+                f"[tune] result pairs={pairs}, chunk={chunk} | "
+                f"median_eps={r['throughput_median']:.1f} | wall={r['wall_mean_s']:.2f}s | "
+                f"peak_reserved={r['gpu_peak_reserved_gb']:.2f}GB",
+                flush=True,
+            )
+            results.append(r)
+
+    if not results:
+        raise RuntimeError("No valid tuning candidates were produced.")
+
+    best = max(results, key=lambda x: float(x["throughput_median"]))
+    return best, results
+
+
+def build_tune_key(
+    args: argparse.Namespace,
+    env_id: str,
+    xml_path: str,
+    obs_dim: int,
+    action_dim: int,
+) -> str:
+    dev = jax.devices()[0]
+    payload = {
+        "env_id": env_id,
+        "xml_sha256": file_sha256(xml_path),
+        "obs_dim": int(obs_dim),
+        "action_dim": int(action_dim),
+        "hidden": int(args.hidden),
+        "rank": int(args.rank),
+        "episodes_per_candidate": int(args.episodes_per_candidate),
+        "rollout_steps": int(args.rollout_steps),
+        "jax_version": str(jax.__version__),
+        "mujoco_version": str(mujoco.__version__),
+        "platform": str(dev.platform),
+        "device_kind": str(getattr(dev, "device_kind", "")),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def parse_args() -> argparse.Namespace:
@@ -903,43 +965,33 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Deprecated compatibility flag; ignored in MJX mode.",
     )
+    parser.add_argument("--tune_only", action="store_true", help="Run shape tuning and exit.")
     parser.add_argument(
-        "--dry_run_compile",
+        "--tune_before_train",
         action="store_true",
-        help="Compile and benchmark one evaluator chunk, then exit.",
+        help="Run shape tuning before training and use tuned values.",
     )
     parser.add_argument(
-        "--dry_run_repeats",
-        type=int,
-        default=2,
-        help="Number of dry-run evaluator calls. First call includes JIT compile.",
+        "--tune_cache_path",
+        type=str,
+        default="humanoid/mjx_tune_cache.json",
+        help="Persistent cache of tuned pairs/chunk keyed by model+hardware+versions.",
     )
-
     parser.add_argument(
-        "--autotune_warmup_iters",
-        type=int,
-        default=0,
-        help="If >0, autotune pairs/chunk during the first N iterations.",
+        "--ignore_tune_cache",
+        action="store_true",
+        help="Ignore cached tuned values and use CLI pairs/chunk.",
     )
-    parser.add_argument("--autotune_pairs_cap", type=int, default=32768)
-    parser.add_argument("--autotune_chunk_cap", type=int, default=1024)
-    parser.add_argument("--autotune_pairs_step", type=int, default=64)
-    parser.add_argument("--autotune_chunk_step", type=int, default=8)
-    parser.add_argument("--autotune_gpu_used_target", type=float, default=0.90)
-    parser.add_argument("--autotune_peak_reserved_target", type=float, default=0.88)
-    parser.add_argument("--autotune_min_scale", type=float, default=0.70)
-    parser.add_argument("--autotune_max_scale", type=float, default=1.80)
+    parser.add_argument("--tune_pairs_grid", type=str, default="")
+    parser.add_argument("--tune_chunk_grid", type=str, default="")
+    parser.add_argument("--tune_repeats", type=int, default=2)
+    parser.add_argument("--tune_burnin", type=int, default=1)
+    parser.add_argument("--tune_peak_reserved_max", type=float, default=0.85)
 
     parser.add_argument("--results_root", type=str, default="humanoid/results")
     parser.add_argument("--run_name", type=str, default="")
     parser.add_argument("--log_every", type=int, default=5)
     parser.add_argument("--checkpoint_every", type=int, default=10)
-    parser.add_argument(
-        "--headroom_target_iter_sec",
-        type=float,
-        default=600.0,
-        help="Target iteration duration used to estimate a larger pairs count.",
-    )
 
     return parser.parse_args()
 
@@ -1007,20 +1059,14 @@ def main() -> None:
             "sigma",
             "pairs_used",
             "chunk_used",
-            "autotuned",
             "mean_ep_len",
             "env_steps",
             "actual_env_steps",
             "env_slot_util",
-            "eval_policy_share",
-            "eval_env_share",
             "cand_per_sec",
             "gpu_used_frac",
             "gpu_peak_reserved_frac",
             "gpu_peak_reserved_gb",
-            "suggest_pairs",
-            "suggest_chunk",
-            "suggest_envs",
             "fps",
             "elapsed_min",
         ],
@@ -1069,53 +1115,64 @@ def main() -> None:
 
     current_pairs = int(args.pairs)
     current_chunk = int(args.candidate_chunk)
-    evaluator = build_evaluator(current_chunk)
 
-    print(
-        f"MJX evaluator: chunk={current_chunk}, "
-        f"episodes/candidate={args.episodes_per_candidate}, envs={evaluator.num_envs}",
-        flush=True,
-    )
-    if args.autotune_warmup_iters > 0:
+    tune_key = build_tune_key(args=args, env_id=env_id, xml_path=xml_path, obs_dim=obs_dim, action_dim=action_dim)
+    tune_cache = load_tune_cache(args.tune_cache_path)
+    cached = tune_cache["entries"].get(tune_key)
+    if cached and (not args.ignore_tune_cache) and (not args.tune_before_train) and (not args.tune_only):
+        current_pairs = int(cached["pairs"])
+        current_chunk = int(cached["chunk"])
         print(
-            "Autotune enabled: "
-            f"warmup_iters={args.autotune_warmup_iters}, "
-            f"pairs_cap={args.autotune_pairs_cap}, chunk_cap={args.autotune_chunk_cap}",
+            f"[tune] loaded cached pairs/chunk {current_pairs}/{current_chunk} from {args.tune_cache_path}",
             flush=True,
         )
 
+    if args.tune_before_train or args.tune_only:
+        best, all_results = tune_shapes(build_evaluator=build_evaluator, theta=theta, args=args)
+        current_pairs = int(best["pairs"])
+        current_chunk = int(best["chunk"])
+        tune_cache["entries"][tune_key] = {
+            "pairs": current_pairs,
+            "chunk": current_chunk,
+            "throughput_median": float(best["throughput_median"]),
+            "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+        save_tune_cache(args.tune_cache_path, tune_cache)
+        with open(os.path.join(run_dir, "tune_report.json"), "w") as f:
+            json.dump(
+                {
+                    "best": best,
+                    "results": all_results,
+                    "cache_path": args.tune_cache_path,
+                    "cache_key": tune_key,
+                },
+                f,
+                indent=2,
+            )
+        print(
+            f"[tune] selected pairs/chunk {current_pairs}/{current_chunk} "
+            f"(median_eps={float(best['throughput_median']):.1f})",
+            flush=True,
+        )
+        if args.tune_only:
+            logger.close()
+            return
+
+    evaluator = build_evaluator(current_chunk)
+    print(
+        f"MJX evaluator: chunk={current_chunk}, "
+        f"episodes/candidate={args.episodes_per_candidate}, envs={evaluator.num_envs}, pairs={current_pairs}",
+        flush=True,
+    )
+    print("[compile] warming JIT for selected shapes...", flush=True)
+    t_compile0 = time.perf_counter()
+    evaluator.evaluate_population(theta[None, :], seed_base=int(args.seed + 4242))
+    print(f"[compile] done in {time.perf_counter() - t_compile0:.1f}s", flush=True)
+
     best_base_return = -float("inf")
     start = time.time()
-    chunk_autotune_updates = 0
 
     try:
-        if args.dry_run_compile:
-            print(
-                f"Dry-run compile mode: chunk={current_chunk}, repeats={max(1, int(args.dry_run_repeats))}",
-                flush=True,
-            )
-            dry = run_dry_compile_check(
-                evaluator=evaluator,
-                theta=theta,
-                seed_base=args.seed + 123_456,
-                repeats=args.dry_run_repeats,
-            )
-            for entry in dry["runs"]:
-                print(
-                    f"  dry_run {int(entry['run_idx'])}: wall={entry['wall_s']:.2f}s | "
-                    f"eff_steps={int(entry['effective_env_steps'])} | eff_fps={entry['effective_fps']:.1f}",
-                    flush=True,
-                )
-            gpu = dry["gpu"]
-            if np.isfinite(float(gpu["gpu_used_frac"])):
-                print(
-                    f"  dry_run gpu: used={float(gpu['gpu_used_frac'])*100:.1f}% | "
-                    f"peak_reserved={float(gpu['gpu_peak_reserved_gb']):.2f}GB",
-                    flush=True,
-                )
-            with open(os.path.join(run_dir, "dry_run_compile.json"), "w") as f:
-                json.dump(dry, f, indent=2)
-            return
 
         for iteration in range(1, args.iters + 1):
             iter_t0 = time.time()
@@ -1177,33 +1234,12 @@ def main() -> None:
             mean_ep_len = float(np.mean(cand_lengths_np))
             theta_norm = float(np.linalg.norm(np.asarray(theta)))
 
-            timed_total = float(eval_stats["policy_s"] + eval_stats["env_s"] + eval_stats["tensor_s"])
-            if timed_total > 0.0:
-                eval_policy_share = float(eval_stats["policy_s"] / timed_total)
-                eval_env_share = float(eval_stats["env_s"] / timed_total)
-            else:
-                eval_policy_share = float("nan")
-                eval_env_share = float("nan")
-
             cand_per_sec = float((2 * K) / max(float(eval_stats["wall_s"]), 1e-9))
 
             gpu = get_gpu_stats()
             gpu_peak_reserved_frac = float(gpu["gpu_peak_reserved_frac"])
             gpu_peak_reserved_gb = float(gpu["gpu_peak_reserved_gb"])
             gpu_used_frac = float(gpu["gpu_used_frac"])
-
-            if np.isfinite(gpu_peak_reserved_frac) and gpu_peak_reserved_frac > 0:
-                mem_scale = max(1.0, min(4.0, 0.85 / gpu_peak_reserved_frac))
-            else:
-                mem_scale = 1.0
-
-            suggest_chunk = int(max(iter_chunk, round(iter_chunk * mem_scale)))
-            suggest_pairs = int(
-                max(iter_pairs, round(iter_pairs * (args.headroom_target_iter_sec / max(iter_elapsed, 1e-9))))
-            )
-            suggest_envs = int(suggest_chunk * args.episodes_per_candidate)
-            autotuned = 0
-            autotune_message = ""
 
             if iteration % args.log_every == 0 or iteration == 1:
                 np.savez_compressed(
@@ -1212,9 +1248,6 @@ def main() -> None:
                     lengths=cand_lengths_np,
                     exploded=cand_exploded_np.astype(np.int8),
                     eval_wall_s=float(eval_stats["wall_s"]),
-                    eval_policy_s=float(eval_stats["policy_s"]),
-                    eval_env_s=float(eval_stats["env_s"]),
-                    eval_tensor_s=float(eval_stats["tensor_s"]),
                     effective_env_steps=effective_env_steps,
                     actual_env_steps=actual_env_steps,
                     env_slot_util=env_slot_util,
@@ -1229,22 +1262,12 @@ def main() -> None:
                 flush=True,
             )
 
-            if np.isfinite(eval_policy_share) and np.isfinite(eval_env_share):
-                split_tensor = max(0.0, 1.0 - eval_policy_share - eval_env_share)
-                print(
-                    f"  profile | cand/s {cand_per_sec:8.1f} | eval split policy/env/tensor "
-                    f"{eval_policy_share*100:5.1f}/{eval_env_share*100:5.1f}/{split_tensor*100:5.1f}% | "
-                    f"env_util {env_slot_util*100:5.1f}% ({effective_env_steps}/{actual_env_steps} active slots) | "
-                    f"actual_fps {actual_fps:9.1f}",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"  profile | cand/s {cand_per_sec:8.1f} | "
-                    f"env_util {env_slot_util*100:5.1f}% ({effective_env_steps}/{actual_env_steps} active slots) | "
-                    f"actual_fps {actual_fps:9.1f}",
-                    flush=True,
-                )
+            print(
+                f"  profile | cand/s {cand_per_sec:8.1f} | "
+                f"env_util {env_slot_util*100:5.1f}% ({effective_env_steps}/{actual_env_steps} active slots) | "
+                f"actual_fps {actual_fps:9.1f}",
+                flush=True,
+            )
 
             if np.isfinite(gpu_used_frac):
                 print(
@@ -1252,47 +1275,6 @@ def main() -> None:
                     f"({gpu_peak_reserved_frac*100:5.1f}% of total)",
                     flush=True,
                 )
-
-            print(
-                f"  headroom| suggest next-run pairs ~{suggest_pairs} "
-                f"(target {args.headroom_target_iter_sec:.0f}s/iter), "
-                f"candidate_chunk ~{suggest_chunk}, envs ~{suggest_envs}",
-                flush=True,
-            )
-
-            if args.autotune_warmup_iters > 0 and iteration <= args.autotune_warmup_iters:
-                next_pairs, next_chunk, notes = propose_autotuned_batch_sizes(
-                    pairs=current_pairs,
-                    chunk=current_chunk,
-                    iter_elapsed=iter_elapsed,
-                    gpu_used_frac=gpu_used_frac,
-                    gpu_peak_reserved_frac=gpu_peak_reserved_frac,
-                    args=args,
-                )
-                if next_pairs != current_pairs or next_chunk != current_chunk:
-                    prev_pairs = current_pairs
-                    prev_chunk = current_chunk
-                    blocked_chunk_change = False
-                    current_pairs = int(next_pairs)
-                    if next_chunk != current_chunk:
-                        if chunk_autotune_updates < 1:
-                            evaluator.close()
-                            current_chunk = int(next_chunk)
-                            evaluator = build_evaluator(current_chunk)
-                            chunk_autotune_updates += 1
-                        else:
-                            blocked_chunk_change = True
-                            next_chunk = current_chunk
-                    autotuned = int((current_pairs != prev_pairs) or (current_chunk != prev_chunk))
-                    autotune_message = (
-                        f"autotune update pairs {prev_pairs}->{current_pairs}, "
-                        f"chunk {prev_chunk}->{current_chunk}"
-                    )
-                    if blocked_chunk_change:
-                        autotune_message += " (chunk retune locked after first rebuild)"
-                else:
-                    autotune_message = "autotune kept current pairs/chunk"
-                print(f"  autotune| {autotune_message} | {'; '.join(notes)}", flush=True)
 
             logger.log(
                 {
@@ -1308,20 +1290,14 @@ def main() -> None:
                     "sigma": args.sigma,
                     "pairs_used": iter_pairs,
                     "chunk_used": iter_chunk,
-                    "autotuned": autotuned,
                     "mean_ep_len": mean_ep_len,
                     "env_steps": effective_env_steps,
                     "actual_env_steps": actual_env_steps,
                     "env_slot_util": env_slot_util,
-                    "eval_policy_share": eval_policy_share,
-                    "eval_env_share": eval_env_share,
                     "cand_per_sec": cand_per_sec,
                     "gpu_used_frac": gpu_used_frac,
                     "gpu_peak_reserved_frac": gpu_peak_reserved_frac,
                     "gpu_peak_reserved_gb": gpu_peak_reserved_gb,
-                    "suggest_pairs": suggest_pairs,
-                    "suggest_chunk": suggest_chunk,
-                    "suggest_envs": suggest_envs,
                     "fps": fps,
                     "elapsed_min": elapsed / 60.0,
                 }
