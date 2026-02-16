@@ -77,57 +77,65 @@ def main():
     logger = CSVLogger(os.path.join(run_dir, "train_log.csv"), ["iter", "base_return", "cand_mean", "fps", "elapsed_min"])
     enable_jax_compilation_cache("humanoid/jax_compile_cache")
 
-    def rollout_fn(theta_pop, rollout_key):
-        """Rollout a population of policies, potentially in chunks."""
-        K = theta_pop.shape[0]
+    # Compile a single-chunk rollout function
+    def rollout_chunk(chunk_theta, chunk_key):
+        """Rollout a single chunk of candidates."""
+        K_chunk = chunk_theta.shape[0]
         E = args.episodes_per_candidate
-        chunk_size = args.candidate_chunk if args.candidate_chunk > 0 else K
-        num_chunks = K // chunk_size
         
-        # Ensure K is divisible by chunk_size for simplicity in this ES implementation
-        if K % chunk_size != 0:
-            # Fallback to no chunking or warn
-            chunk_size = K
-            num_chunks = 1
+        # Reset envs for this chunk
+        reset_keys = jax.random.split(chunk_key, K_chunk * E)
+        data, obs = jax.vmap(env.reset_one)(reset_keys)
+        
+        # Reshape for [K_chunk, E, ...]
+        obs = obs.reshape((K_chunk, E, -1))
+        h = jnp.zeros((K_chunk, E, cfg.N))
+        returns = jnp.zeros((K_chunk, E))
+        done = jnp.zeros((K_chunk, E), dtype=bool)
 
-        theta_pop = theta_pop.reshape((num_chunks, chunk_size, -1))
-        keys = jax.random.split(rollout_key, num_chunks)
-
-        def chunk_step(chunk_theta, chunk_key):
-            # Reset all envs in chunk
-            reset_keys = jax.random.split(chunk_key, chunk_size * E)
-            data, obs = jax.vmap(env.reset_one)(reset_keys)
+        def step_fn(i, carry):
+            h, data, obs, returns, done = carry
+            h_next, action = policy.batched_rollout(h, obs, chunk_theta)
             
-            # Reshape for [chunk_size, E, ...]
-            obs = obs.reshape((chunk_size, E, -1))
-            h = jnp.zeros((chunk_size, E, cfg.N))
-            returns = jnp.zeros((chunk_size, E))
-            done = jnp.zeros((chunk_size, E), dtype=bool)
+            action_flat = action.reshape((K_chunk * E, -1))
+            data_next, obs_next, reward, terminated = jax.vmap(env.step)(data, action_flat)
+            
+            obs_next = obs_next.reshape((K_chunk, E, -1))
+            reward = reward.reshape((K_chunk, E))
+            terminated = terminated.reshape((K_chunk, E))
+            
+            returns += reward * (~done)
+            done |= terminated
+            return h_next, data_next, obs_next, returns, done
 
-            def step_fn(i, carry):
-                h, data, obs, returns, done = carry
-                h_next, action = policy.batched_rollout(h, obs, chunk_theta)
-                
-                action_flat = action.reshape((chunk_size * E, -1))
-                data_next, obs_next, reward, terminated = jax.vmap(env.step)(data, action_flat)
-                
-                obs_next = obs_next.reshape((chunk_size, E, -1))
-                reward = reward.reshape((chunk_size, E))
-                terminated = terminated.reshape((chunk_size, E))
-                
-                returns += reward * (~done)
-                done |= terminated
-                return h_next, data_next, obs_next, returns, done
+        final_carry = jax.lax.fori_loop(0, args.rollout_steps, step_fn, (h, data, obs, returns, done))
+        return jnp.mean(final_carry[3], axis=1)
 
-            final_carry = jax.lax.fori_loop(0, args.rollout_steps, step_fn, (h, data, obs, returns, done))
-            return jnp.mean(final_carry[3], axis=1) # Mean over episodes
+    jit_rollout_chunk = jax.jit(rollout_chunk)
 
-        # Process chunks sequentially using scan to save memory
-        _, all_returns = jax.lax.scan(lambda _, x: (None, chunk_step(x[0], x[1])), None, (theta_pop, keys))
-        return all_returns.reshape((K,))
-
-    jit_rollout = jax.jit(rollout_fn)
-
+    def rollout_fn(theta_pop, rollout_key):
+        """Process population in chunks using a Python loop."""
+        K = theta_pop.shape[0]
+        chunk_size = args.candidate_chunk if args.candidate_chunk > 0 else K
+        
+        # Ensure K is divisible (or handle remainder, but simplicity for now)
+        if K % chunk_size != 0:
+            chunk_size = K # Fallback
+        
+        num_chunks = K // chunk_size
+        theta_chunks = theta_pop.reshape((num_chunks, chunk_size, -1))
+        keys = jax.random.split(rollout_key, num_chunks)
+        
+        all_results = []
+        for i in range(num_chunks):
+            # The .block_until_ready() helps keep the GPU loop fed without Python getting too far ahead
+            res = jit_rollout_chunk(theta_chunks[i], keys[i])
+            res.block_until_ready() 
+            all_results.append(res)
+            
+        return jnp.concatenate(all_results, axis=0)
+    # jit_rollout = jax.jit(rollout_fn) # Not needed as we manually JIT chunks
+    
     print(f"Starting ES loop on {env_id}...", flush=True)
     start_time = time.time()
     
@@ -140,7 +148,7 @@ def main():
         pop_theta = jnp.concatenate([theta + args.sigma * epsilon, theta - args.sigma * epsilon], axis=0)
         
         # Evaluate population
-        cand_returns = jit_rollout(pop_theta, rollout_key)
+        cand_returns = rollout_fn(pop_theta, rollout_key)
         
         # Gradient Estimation
         fitness = rank_transform(cand_returns)
@@ -156,7 +164,7 @@ def main():
 
         # Logging & Checkpointing
         if it % args.log_every == 0 or it == 1:
-            base_ret = float(jit_rollout(theta[None, :], rollout_key)[0])
+            base_ret = float(rollout_fn(theta[None, :], rollout_key)[0])
             elapsed = (time.time() - start_time) / 60
             fps = (args.pairs * 2 * args.episodes_per_candidate * args.rollout_steps) / (time.time() - it_start)
             print(f"Iter {it:3d} | Base Ret: {base_ret:8.2f} | Cand Mean: {jnp.mean(cand_returns):8.2f} | FPS: {fps:6.0f} | {elapsed:4.1f}m", flush=True)
