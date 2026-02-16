@@ -14,11 +14,30 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$PROJECT_ROOT"
+START_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
+SEARCH_DIR="$(cd "$START_DIR" && pwd)"
+PROJECT_ROOT=""
 
-mkdir -p "$SCRIPT_DIR/logs"
+for _ in 1 2 3 4 5 6; do
+  if [ -f "$SEARCH_DIR/requirements.txt" ] && [ -f "$SEARCH_DIR/humanoid/pertubative_trained_rnn_rl.py" ]; then
+    PROJECT_ROOT="$SEARCH_DIR"
+    break
+  fi
+  PARENT_DIR="$(dirname "$SEARCH_DIR")"
+  if [ "$PARENT_DIR" = "$SEARCH_DIR" ]; then
+    break
+  fi
+  SEARCH_DIR="$PARENT_DIR"
+done
+
+if [ -z "$PROJECT_ROOT" ]; then
+  echo "ERROR: Could not locate project root from START_DIR=$START_DIR"
+  echo "Expected files: requirements.txt and humanoid/pertubative_trained_rnn_rl.py"
+  exit 1
+fi
+
+cd "$PROJECT_ROOT"
+mkdir -p "$PROJECT_ROOT/humanoid/logs"
 
 echo "JobID: $SLURM_JOB_ID"
 echo "Node: $(hostname)"
