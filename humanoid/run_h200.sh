@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=humanoid_es
+#SBATCH --job-name=humanoid_mjx_es
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --partition=sy-grp
@@ -75,36 +75,51 @@ else
   exit 1
 fi
 
-# Ensure CUDA-enabled PyTorch on the node.
-python -m pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu124
-
-# RL dependencies for MuJoCo Humanoid.
-# Pin to versions with prebuilt wheels on Python 3.9 to avoid source builds
-# that require MUJOCO_PATH.
-python -m pip install --upgrade "gymnasium[mujoco]==0.29.1" "mujoco==2.3.7"
+# MJX stack for CUDA 12.x GPUs.
+python -m pip install --upgrade "jax[cuda12]" "mujoco>=3.2.0" "mujoco-mjx>=3.2.0"
 
 python - <<'PY'
-import torch
-print("torch:", torch.__version__)
-print("torch.version.cuda:", torch.version.cuda)
-print("cuda available:", torch.cuda.is_available())
-print("device count:", torch.cuda.device_count())
-if torch.cuda.is_available():
-    print("device 0:", torch.cuda.get_device_name(0))
+import jax
+import jax.numpy as jnp
+import mujoco
+from mujoco import mjx
+
+print("jax:", jax.__version__)
+print("mujoco:", mujoco.__version__)
+print("devices:", jax.devices())
+
+x = jnp.ones((1024, 1024), dtype=jnp.float32)
+y = x @ x
+print("matmul check:", float(y[0, 0]))
+print("mjx module:", mjx.__name__)
 PY
 
-# Avoid thread oversubscription across many env worker processes.
+# Avoid CPU oversubscription and tell JAX to prefer GPU first.
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
+export JAX_PLATFORMS=gpu,cpu
+export XLA_PYTHON_CLIENT_PREALLOCATE=true
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.92
 
 # Headless MuJoCo defaults.
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
 
+# Optional preflight (compile-only):
+# python3 humanoid/pertubative_trained_rnn_rl.py \
+#     --env_candidates "Humanoid-v4" \
+#     --hidden 1024 \
+#     --rank 32 \
+#     --candidate_chunk 256 \
+#     --episodes_per_candidate 2 \
+#     --rollout_steps 500 \
+#     --dry_run_compile \
+#     --dry_run_repeats 2
+
 python3 humanoid/pertubative_trained_rnn_rl.py \
-    --env_candidates "Humanoid-v5,Humanoid-v4" \
+    --env_candidates "Humanoid-v4" \
     --iters 10 \
-    --pairs 2048 \
+    --pairs 4096 \
     --sigma 0.03 \
     --theta_lr 0.01 \
     --hidden 1024 \
@@ -112,12 +127,14 @@ python3 humanoid/pertubative_trained_rnn_rl.py \
     --k_in 50 \
     --leak 0.2 \
     --episodes_per_candidate 2 \
-    --candidate_chunk 64 \
+    --candidate_chunk 256 \
     --rollout_steps 500 \
-    --torch_num_threads 4 \
+    --autotune_warmup_iters 3 \
+    --autotune_pairs_cap 32768 \
+    --autotune_chunk_cap 1024 \
     --log_every 1 \
     --checkpoint_every 1 \
     --headroom_target_iter_sec 600 \
     --results_root humanoid/results
 
-echo "Humanoid perturbative RL training complete."
+echo "Humanoid MJX perturbative RL training complete."
