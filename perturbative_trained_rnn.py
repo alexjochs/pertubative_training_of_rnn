@@ -41,6 +41,11 @@ class ReservoirConfig:
 
 
 class PretrainedResNet18Encoder(nn.Module):
+    """
+    ResNet18 encoder adapted for single-channel input and custom embedding dimension.
+    The classification head is replaced with a linear projection.
+    All parameters are frozen.
+    """
     def __init__(self, emb_dim: int = 128):
         super().__init__()
         resnet = torchvision.models.resnet18(weights="DEFAULT")
@@ -72,8 +77,8 @@ class PretrainedResNet18Encoder(nn.Module):
 
 class Reservoir(nn.Module):
     """
-    h_{t+1} = (1-leak) h_t + leak * tanh( (W0 + U V^T) h_t + Win z_t + b )
-    W0 sparse COO, Win dense.
+    Reservoir with a sparse recurrent base (W0) and a low-rank adapter (U, V).
+    Dynamics: h_{t+1} = (1-leak)*h_t + leak * tanh(W0 h_t + U V^T h_t + W_in z_t + b)
     """
     def __init__(self, cfg: ReservoirConfig, device: torch.device):
         super().__init__()
@@ -131,20 +136,18 @@ class Reservoir(nn.Module):
         self.V.data.copy_(V)
 
     def step(self, h: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        # Recurrent dense: h @ W0.t()
-        # W0 is [N, N]. h is [B, N].
+        # 1. Recurrent base: W0 (sparse) @ h
         rec0 = h @ self.W0.t()
 
-        # Low-rank: (U V^T) h = U (V^T h)
+        # 2. Low-rank adapter: U @ (V^T @ h)
         low = (h @ self.V) @ self.U.t()
 
+        # 3. Input projection
         inp = z @ self.Win.t()  # [B,N]
+
         pre = rec0 + low + inp + self.b
-
         nh = torch.tanh(pre)
-        h_next = (1.0 - self.cfg.leak) * h + self.cfg.leak * nh
-
-        return h_next
+        return (1.0 - self.cfg.leak) * h + self.cfg.leak * nh
 
     @torch.no_grad()
     def rollout_loss(self, z_seq: torch.Tensor, decoder: nn.Linear, warmup: int) -> torch.Tensor:
@@ -229,12 +232,6 @@ class Reservoir(nn.Module):
             
             # pre += low_temp @ U.t()
             pre_buffer.baddbmm_(low_temp, cand_U.transpose(1, 2))
-            
-            # DEBUG: Memory check at t=0
-            if t == 0:
-                 # Calculate approximate GB
-                 mem_gb = torch.cuda.memory_allocated() / 1e9
-                 print(f"DEBUG[t=0]: Memory Optimized: {mem_gb:.2f} GB", flush=True)
 
             # 5. Activation (In-place)
             # pre_buffer becomes 'nh'
@@ -284,10 +281,15 @@ def make_decoder(N: int, D: int, device: torch.device) -> nn.Linear:
 
 
 def rank_transform(raw_losses: torch.Tensor) -> torch.Tensor:
+    """
+    Transform losses into rank-based fitness weights.
+    Lower loss -> Higher rank -> Higher positive weight.
+    Returns:
+        Tensor of shape [M], centered so that mean is 0.
+    """
     M = len(raw_losses)
     ranks = torch.empty_like(raw_losses)
     order = torch.argsort(raw_losses)
-    # FIX: Ensure arange is on the same device as ranks
     ranks[order] = torch.arange(M, dtype=torch.float32, device=raw_losses.device)
     w = -(ranks / (M - 1) - 0.5)
     w = w - w.mean()
@@ -355,19 +357,19 @@ def visualize_batch(z_seq: torch.Tensor, decoder: nn.Linear, res: Reservoir, war
     plt.close(fig)
 
 
-def transform_cifar_norm(x):
+def transform_image_norm(x):
+    """Normalize image to [0, 1]."""
     return x.float() / 255.0
 
 def precompute_embeddings(args, device):
     print("Pre-computing embeddings for the entire dataset...", flush=True)
     t0 = time.time()
     
-    # transform = transforms.Lambda(lambda x: x.float() / 255.0)
     mm0 = torchvision.datasets.MovingMNIST(
         root=args.data_root,
         split=None,
         download=True,
-        transform=transform_cifar_norm
+        transform=transform_image_norm
     )
     
     # Create loader
@@ -459,7 +461,7 @@ def main() -> None:
     dataset_embeddings = precompute_embeddings(args, device)
     dataset_len = len(dataset_embeddings)
 
-    # 2. Setup Modeis
+    # 2. Setup Models
     N, D, rnk = args.hidden, args.emb_dim, args.rank
     theta_dim = 2 * N * rnk
 
@@ -534,29 +536,20 @@ def main() -> None:
         base_loss = train_decoder_on_batch(seed_it, z_batch)
 
         # D. Evaluate Candidates - VECTORIZED
-        # 1. Expand parameters for all candidates: K = 2 * args.pairs
-        # We need U [K, N, r] and V [K, N, r]
-        # theta is [2*N*r].
-        # We generate noise epsilon [pairs, 2*N*r].
-        # candidates = theta +/- sigma * epsilon
-        
-        # Let's construct pop_theta directly as a tensor [K, theta_dim]
-        # epsilon is [args.pairs, theta_dim].
-        # theta is [theta_dim].
-        
+        # Generate noise: epsilon [pairs, 2*N*r]
         K = args.pairs
-        # Generate noise directly on GPU [Pairs, ThetaDim]
         epsilon = torch.randn((K, theta_dim), device=device, dtype=torch.float32)
         
-        # Pos candidates: theta + sigma * epsilon
+        # Create candidates: theta +/- sigma * epsilon
         theta_unsqueezed = theta.unsqueeze(0)
-        pop_pos = theta_unsqueezed + args.sigma * epsilon
-        pop_neg = theta_unsqueezed - args.sigma * epsilon
+        pop_theta = torch.cat([
+            theta_unsqueezed + args.sigma * epsilon,
+            theta_unsqueezed - args.sigma * epsilon
+        ], dim=0) # [2*K, theta_dim]
         
-        pop_theta = torch.cat([pop_pos, pop_neg], dim=0) # [K, theta_dim] where K = 2*pairs
         
         # Free memory of intermediate tensors
-        del pop_pos, pop_neg
+        # (Variables are now temporary in the cat call, so they are freed automatically)
         
         # Reshape into U and V
         # theta structure: [U_flat, V_flat]
@@ -570,20 +563,8 @@ def main() -> None:
         cand_V = pop_V_flat.view(-1, N, r)
         
         # Batched Rollout
-        # z_batch is [B, T, D]
-        # Memory Check:
-        # h state: [K, B, N]
-        # K=8192, B=256, N=4096 => 8192*256*4096*4 bytes = 34 GB.
-        # H200 has 141 GB. Safe.
-        
-        # Memory Check:
-        # h state: [K, B, N]
-        # K=8192, B=128, N=4096 => 8192*128*4096*4 bytes = 17 GB.
-        # But intermediate states expand ~5x.
-        
-        # DEBUG: Print memory before full batch
-        print(f"DEBUG: Memory Before Rollout: {torch.cuda.memory_allocated()/1e9:.2f} GB (Allocated), {torch.cuda.memory_reserved()/1e9:.2f} GB (Reserved)", flush=True)
         cand_losses = reservoir.batched_rollout_loss(z_batch, decoder, args.warmup, cand_U, cand_V)
+
 
         
         # E. Update Theta
@@ -601,19 +582,15 @@ def main() -> None:
         grad_estimate = (w_pos.view(-1, 1) * epsilon - w_neg.view(-1, 1) * epsilon).mean(dim=0)
         
         # Optimization Step
-        # Since we want to Minimize loss but rank_transform assigns higher values to better (lower) losses,
-        # we treat this as maximizing fitness. Adam minimizes, so we negate the gradient.
-        # Wait, let's double check:
-        # Rank transform: Best individual (lowest loss) -> Highest rank -> Positive weight.
-        # Gradient Ascent: theta += alpha * (fitness * noise)
-        # Adam Step (Minimize): theta -= alpha * grad
-        # So we set grad = -(fitness * noise) to achieve ascent.
+        # Maximize fitness (rank-based weights) via Gradient Ascent.
+        # Adam minimizes, so we negate the estimated gradient:
+        # grad_estimate ~ (w_pos - w_neg) * epsilon
+        # theta_new = theta - lr * (-grad_estimate) = theta + lr * grad_estimate
         theta.grad = -grad_estimate
         
         theta_optimizer.step()
         theta_optimizer.zero_grad()
         
-        # Logging
         # Logging
         if iteration % args.log_every == 0:
             elapsed_total = time.time() - start_time
