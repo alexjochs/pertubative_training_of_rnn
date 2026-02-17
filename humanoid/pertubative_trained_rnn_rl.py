@@ -77,88 +77,56 @@ def main():
     logger = CSVLogger(os.path.join(run_dir, "train_log.csv"), ["iter", "base_return", "cand_mean", "fps", "elapsed_min"])
     enable_jax_compilation_cache("humanoid/jax_compile_cache")
 
-    # Compile a single-chunk rollout function
-    def rollout_chunk(chunk_theta, chunk_key):
-        """Rollout a single chunk of candidates."""
-        K_chunk = chunk_theta.shape[0]
-        E = args.episodes_per_candidate
-        
-        # Reset envs for this chunk
-        reset_keys = jax.random.split(chunk_key, K_chunk * E)
-        data, obs = jax.vmap(env.reset_one)(reset_keys)
-        
-        # Reshape for [K_chunk, E, ...]
-        obs = obs.reshape((K_chunk, E, -1))
-        h = jnp.zeros((K_chunk, E, cfg.N))
-        returns = jnp.zeros((K_chunk, E))
-        done = jnp.zeros((K_chunk, E), dtype=bool)
-        
-        # Debug trackers
-        termination_step = jnp.zeros((K_chunk, E))
-        bad_state_count = jnp.zeros((K_chunk, E))
-
-        def step_fn(carry, step_idx):
-            h, data, obs, returns, done, term_step, bad_cnt = carry
-            h_next, action = policy.batched_rollout(h, obs, chunk_theta)
-            
-            action_flat = action.reshape((K_chunk * E, -1))
-            data_next, obs_next, reward, terminated = jax.vmap(env.step)(data, action_flat)
-            
-            obs_next = obs_next.reshape((K_chunk, E, -1))
-            reward = reward.reshape((K_chunk, E))
-            terminated = terminated.reshape((K_chunk, E))
-            
-            # Identify if this is a "bad_state" termination (reward is 0 and terminated is True usually means bad state in our env logic)
-            # But let's check specifically if reward was zeroed out while being 'bad'.
-            # Actually, in env.py we set terminated directly for bad state.
-            
-            # Track when it terminated
-            term_step = jnp.where((~done) & terminated, step_idx, term_step)
-            
-            returns += reward * (~done)
-            done |= terminated
-            return (h_next, data_next, obs_next, returns, done, term_step, bad_cnt), None
-
-        # Use scan for time loop to prevent unrolling
-        final_carry, _ = jax.lax.scan(step_fn, (h, data, obs, returns, done, termination_step, bad_state_count), jnp.arange(args.rollout_steps))
-        
-        # Correct termination step for those that never terminated
-        term_step = final_carry[5]
-        term_step = jnp.where(term_step == 0, args.rollout_steps, term_step)
-        
-        return jnp.mean(final_carry[3], axis=1), jnp.mean(term_step), jnp.mean(final_carry[3])
-
-    jit_rollout_chunk = jax.jit(rollout_chunk)
-
     def rollout_fn(theta_pop, rollout_key):
-        """Process population in chunks using a Python loop."""
+        """Rollout a population of policies, potentially in chunks."""
         K = theta_pop.shape[0]
+        E = args.episodes_per_candidate
         chunk_size = args.candidate_chunk if args.candidate_chunk > 0 else K
+        num_chunks = K // chunk_size
         
+        # Ensure K is divisible by chunk_size for simplicity in this ES implementation
         if K % chunk_size != 0:
             chunk_size = K
-        
-        num_chunks = K // chunk_size
-        theta_chunks = theta_pop.reshape((num_chunks, chunk_size, -1))
+            num_chunks = 1
+
+        theta_pop = theta_pop.reshape((num_chunks, chunk_size, -1))
         keys = jax.random.split(rollout_key, num_chunks)
-        
-        all_results = []
-        for i in range(num_chunks):
-            if i == 0: 
-                print(f"  [Chunk {i+1}/{num_chunks}] Configuring & Compiling... (may take ~2 mins)", flush=True)
-                t0 = time.time()
+
+        def chunk_step(chunk_theta, chunk_key):
+            # Reset all envs in chunk
+            reset_keys = jax.random.split(chunk_key, chunk_size * E)
+            data, obs = jax.vmap(env.reset_one)(reset_keys)
             
-            res, avg_len, avg_ret = jit_rollout_chunk(theta_chunks[i], keys[i])
-            res.block_until_ready()
-            
-            if i == 0:
-                print(f"  [Chunk {i+1}/{num_chunks}] Finished first chunk in {time.time()-t0:.1f}s | Avg Len: {avg_len:.1f} | Chunk Ret: {avg_ret:.1f}", flush=True)
-            
-            all_results.append(res)
-            
-        return jnp.concatenate(all_results, axis=0)
-    # jit_rollout = jax.jit(rollout_fn) # Not needed as we manually JIT chunks
-    
+            # Reshape for [chunk_size, E, ...]
+            obs = obs.reshape((chunk_size, E, -1))
+            h = jnp.zeros((chunk_size, E, cfg.N))
+            returns = jnp.zeros((chunk_size, E))
+            done = jnp.zeros((chunk_size, E), dtype=bool)
+
+            def step_fn(carry, _):
+                h, data, obs, returns, done = carry
+                h_next, action = policy.batched_rollout(h, obs, chunk_theta)
+                
+                action_flat = action.reshape((chunk_size * E, -1))
+                data_next, obs_next, reward, terminated = jax.vmap(env.step)(data, action_flat)
+                
+                obs_next = obs_next.reshape((chunk_size, E, -1))
+                reward = reward.reshape((chunk_size, E))
+                terminated = terminated.reshape((chunk_size, E))
+                
+                returns += reward * (~done)
+                done |= terminated
+                return (h_next, data_next, obs_next, returns, done), None
+
+            final_carry, _ = jax.lax.scan(step_fn, (h, data, obs, returns, done), None, length=args.rollout_steps)
+            return jnp.mean(final_carry[3], axis=1) # Mean over episodes
+
+        # Process chunks sequentially using scan to save memory
+        _, all_returns = jax.lax.scan(lambda _, x: (None, chunk_step(x[0], x[1])), None, (theta_pop, keys))
+        return all_returns.reshape((K,))
+
+    jit_rollout = jax.jit(rollout_fn)
+
     print(f"Starting ES loop on {env_id}...", flush=True)
     start_time = time.time()
     
