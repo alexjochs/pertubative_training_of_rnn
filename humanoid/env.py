@@ -48,12 +48,28 @@ class MJXHumanoidEnv:
     def __init__(self, xml_path: str, spec: HumanoidSpec):
         self.spec = spec
         self.model = mujoco.MjModel.from_xml_path(xml_path)
-        self.mjx_model = mjx.put_model(self.model)
+        
+        # Explicitly place model on GPU (device 0) to avoid any CPU fallback ambiguity
+        try:
+            device = jax.devices("gpu")[0]
+        except:
+            device = jax.devices()[0]
+
+        # Put model on device and CLAMP solver iterations to effectively "time-limit" the physics
+        # This prevents "bad" states from consuming infinite compute (hanging the kernel)
+        mjx_model = mjx.put_model(self.model, device=device)
+        self.mjx_model = mjx_model.replace(
+            opt=mjx_model.opt.replace(
+                iterations=4,     # Newton solver steps (usually converges in 2-5)
+                ls_iterations=4   # Line search iterations
+            )
+        )
+        
         self.obs_dim = infer_obs_dim(spec, self.model)
         self.action_dim = self.model.nu
         
-        # Precompute constants
-        self.body_mass = jnp.array(self.model.body_mass)
+        # Precompute constants (ensure they are on device)
+        self.body_mass = jax.device_put(jnp.array(self.model.body_mass), device)
         self.total_mass = jnp.sum(self.body_mass)
         self.dt = self.model.opt.timestep * spec.frame_skip
         

@@ -92,9 +92,13 @@ def main():
         h = jnp.zeros((K_chunk, E, cfg.N))
         returns = jnp.zeros((K_chunk, E))
         done = jnp.zeros((K_chunk, E), dtype=bool)
+        
+        # Debug trackers
+        termination_step = jnp.zeros((K_chunk, E))
+        bad_state_count = jnp.zeros((K_chunk, E))
 
-        def step_fn(carry, _):
-            h, data, obs, returns, done = carry
+        def step_fn(carry, step_idx):
+            h, data, obs, returns, done, term_step, bad_cnt = carry
             h_next, action = policy.batched_rollout(h, obs, chunk_theta)
             
             action_flat = action.reshape((K_chunk * E, -1))
@@ -104,13 +108,25 @@ def main():
             reward = reward.reshape((K_chunk, E))
             terminated = terminated.reshape((K_chunk, E))
             
+            # Identify if this is a "bad_state" termination (reward is 0 and terminated is True usually means bad state in our env logic)
+            # But let's check specifically if reward was zeroed out while being 'bad'.
+            # Actually, in env.py we set terminated directly for bad state.
+            
+            # Track when it terminated
+            term_step = jnp.where((~done) & terminated, step_idx, term_step)
+            
             returns += reward * (~done)
             done |= terminated
-            return (h_next, data_next, obs_next, returns, done), None
+            return (h_next, data_next, obs_next, returns, done, term_step, bad_cnt), None
 
         # Use scan for time loop to prevent unrolling
-        final_carry, _ = jax.lax.scan(step_fn, (h, data, obs, returns, done), None, length=args.rollout_steps)
-        return jnp.mean(final_carry[3], axis=1)
+        final_carry, _ = jax.lax.scan(step_fn, (h, data, obs, returns, done, termination_step, bad_state_count), jnp.arange(args.rollout_steps))
+        
+        # Correct termination step for those that never terminated
+        term_step = final_carry[5]
+        term_step = jnp.where(term_step == 0, args.rollout_steps, term_step)
+        
+        return jnp.mean(final_carry[3], axis=1), jnp.mean(term_step), jnp.mean(final_carry[3])
 
     jit_rollout_chunk = jax.jit(rollout_chunk)
 
@@ -132,11 +148,11 @@ def main():
                 print(f"  [Chunk {i+1}/{num_chunks}] Configuring & Compiling... (may take ~2 mins)", flush=True)
                 t0 = time.time()
             
-            res = jit_rollout_chunk(theta_chunks[i], keys[i])
+            res, avg_len, avg_ret = jit_rollout_chunk(theta_chunks[i], keys[i])
             res.block_until_ready()
             
             if i == 0:
-                print(f"  [Chunk {i+1}/{num_chunks}] Finished first chunk in {time.time()-t0:.1f}s", flush=True)
+                print(f"  [Chunk {i+1}/{num_chunks}] Finished first chunk in {time.time()-t0:.1f}s | Avg Len: {avg_len:.1f} | Chunk Ret: {avg_ret:.1f}", flush=True)
             
             all_results.append(res)
             
