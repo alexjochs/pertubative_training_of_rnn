@@ -93,7 +93,7 @@ def main():
         returns = jnp.zeros((K_chunk, E))
         done = jnp.zeros((K_chunk, E), dtype=bool)
 
-        def step_fn(i, carry):
+        def step_fn(carry, _):
             h, data, obs, returns, done = carry
             h_next, action = policy.batched_rollout(h, obs, chunk_theta)
             
@@ -106,9 +106,10 @@ def main():
             
             returns += reward * (~done)
             done |= terminated
-            return h_next, data_next, obs_next, returns, done
+            return (h_next, data_next, obs_next, returns, done), None
 
-        final_carry = jax.lax.fori_loop(0, args.rollout_steps, step_fn, (h, data, obs, returns, done))
+        # Use scan for time loop to prevent unrolling
+        final_carry, _ = jax.lax.scan(step_fn, (h, data, obs, returns, done), None, length=args.rollout_steps)
         return jnp.mean(final_carry[3], axis=1)
 
     jit_rollout_chunk = jax.jit(rollout_chunk)
@@ -118,9 +119,8 @@ def main():
         K = theta_pop.shape[0]
         chunk_size = args.candidate_chunk if args.candidate_chunk > 0 else K
         
-        # Ensure K is divisible (or handle remainder, but simplicity for now)
         if K % chunk_size != 0:
-            chunk_size = K # Fallback
+            chunk_size = K
         
         num_chunks = K // chunk_size
         theta_chunks = theta_pop.reshape((num_chunks, chunk_size, -1))
@@ -128,9 +128,16 @@ def main():
         
         all_results = []
         for i in range(num_chunks):
-            # The .block_until_ready() helps keep the GPU loop fed without Python getting too far ahead
+            if i == 0: 
+                print(f"  [Chunk {i+1}/{num_chunks}] Configuring & Compiling... (may take ~2 mins)", flush=True)
+                t0 = time.time()
+            
             res = jit_rollout_chunk(theta_chunks[i], keys[i])
-            res.block_until_ready() 
+            res.block_until_ready()
+            
+            if i == 0:
+                print(f"  [Chunk {i+1}/{num_chunks}] Finished first chunk in {time.time()-t0:.1f}s", flush=True)
+            
             all_results.append(res)
             
         return jnp.concatenate(all_results, axis=0)
