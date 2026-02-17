@@ -4,6 +4,13 @@
 This folder is for the Humanoid RL ES experiment only (`pertubative_trained_rnn_rl.py` + `run_h200.sh`).
 It should use its own environment and dependency path, separate from the root perturbative vision script.
 
+- Iteration 100: Base Ret ~640, Cand Mean ~540 (Learning to balance).
+
+## TODO: Local Playback Script
+- [ ] Create `humanoid/play_humanoid.py`.
+- [ ] Logic: Load `.pkl` checkpoint, initialize `MJXHumanoidEnv` (CPU/Local), and run `mujoco.viewer`.
+- [ ] Goal: Visualize walking progress locally from cluster checkpoints.
+
 ## Cluster Facts (learned on this setup)
 - CUDA module on cluster: `cuda/12.8`
 - Confirmed GPU target: NVIDIA H200
@@ -44,16 +51,16 @@ It should use its own environment and dependency path, separate from the root pe
 - **Entrypoint**: `humanoid/pertubative_trained_rnn_rl.py`
 
 ## Fixed Runtime Shape
-- Runtime shape is fixed:
-  - `pairs=8192`
-  - `candidate_chunk=2048`
+- Runtime shape is optimized for H200 occupancy:
+  - `pairs=16384`
+  - `candidate_chunk=32768` (processes entire population in one batch)
 - The training entrypoint performs a one-time warmup/compile for this shape and writes a marker in:
   - `humanoid/jax_compile_cache`
 - JAX persistent compilation cache is enabled via:
   - `--compile_cache_dir` (defaults to `humanoid/jax_compile_cache`)
 
 ## Performance & Optimization Notes (H200 Verified)
-- **Throughput**: ~41,000 FPS verified with 16,384 candidates.
+- **Throughput**: Target >100,000 FPS with 32,768 candidates in a single chunk.
 - **Physics Stabilization**:
   - `mjx.step` is wrapped in `jax.lax.cond` to catch NaNs in `qpos`/`qvel`/`action` before execution.
   - Solver iterations explicitly clamped to `4` ( Newton) to prevent "silent hangs" on bad states.

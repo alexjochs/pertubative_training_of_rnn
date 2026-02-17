@@ -74,8 +74,17 @@ def main():
     run_dir = os.path.join(args.results_root, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(run_dir, exist_ok=True)
     save_config(args, os.path.join(run_dir, "config.json"))
-    logger = CSVLogger(os.path.join(run_dir, "train_log.csv"), ["iter", "base_return", "cand_mean", "fps", "elapsed_min"])
+    
+    # ML Researcher Stats Headers
+    logger_fields = [
+        "iter", "base_return", "max_return", "cand_mean", 
+        "survival_rate", "u_norm", "v_norm", "wa_norm",
+        "update_ratio", "fps", "elapsed_min"
+    ]
+    logger = CSVLogger(os.path.join(run_dir, "train_log.csv"), logger_fields)
     enable_jax_compilation_cache("humanoid/jax_compile_cache")
+
+    print(f"Logging results to: {run_dir}", flush=True)
 
     def rollout_fn(theta_pop, rollout_key):
         """Rollout a population of policies, potentially in chunks."""
@@ -84,7 +93,7 @@ def main():
         chunk_size = args.candidate_chunk if args.candidate_chunk > 0 else K
         num_chunks = K // chunk_size
         
-        # Ensure K is divisible by chunk_size for simplicity in this ES implementation
+        # Ensure K is divisible by chunk_size for simplicity 
         if K % chunk_size != 0:
             chunk_size = K
             num_chunks = 1
@@ -116,14 +125,20 @@ def main():
                 
                 returns += reward * (~done)
                 done |= terminated
-                return (h_next, data_next, obs_next, returns, done), None
+                return (h_next, data_next, obs_next, returns, done), done
 
-            final_carry, _ = jax.lax.scan(step_fn, (h, data, obs, returns, done), None, length=args.rollout_steps)
-            return jnp.mean(final_carry[3], axis=1) # Mean over episodes
+            # We capture 'done' history to calculate survival rate
+            final_carry, done_history = jax.lax.scan(step_fn, (h, data, obs, returns, done), None, length=args.rollout_steps)
+            
+            # Survival: did they reach the end without done=True?
+            # final_carry[4] is the final 'done' state
+            survived = jnp.logical_not(final_carry[4]) # [chunk_size, E]
+            return jnp.mean(final_carry[3], axis=1), jnp.mean(survived.astype(jnp.float32))
 
         # Process chunks sequentially using scan to save memory
-        _, all_returns = jax.lax.scan(lambda _, x: (None, chunk_step(x[0], x[1])), None, (theta_pop, keys))
-        return all_returns.reshape((K,))
+        _, results = jax.lax.scan(lambda _, x: (None, chunk_step(x[0], x[1])), None, (theta_pop, keys))
+        chunk_returns, chunk_survivals = results
+        return chunk_returns.reshape((K,)), jnp.mean(chunk_survivals)
 
     jit_rollout = jax.jit(rollout_fn)
 
@@ -139,7 +154,7 @@ def main():
         pop_theta = jnp.concatenate([theta + args.sigma * epsilon, theta - args.sigma * epsilon], axis=0)
         
         # Evaluate population
-        cand_returns = rollout_fn(pop_theta, rollout_key)
+        cand_returns, survival_rate = rollout_fn(pop_theta, rollout_key)
         
         # Gradient Estimation
         fitness = rank_transform(cand_returns)
@@ -147,22 +162,54 @@ def main():
         grad = -jnp.mean((w_pos - w_neg) * epsilon, axis=0) # Negative for gradient ascent
 
         # Adam Update
+        m_old = m
         m = beta1 * m + (1 - beta1) * grad
         v = beta2 * v + (1 - beta2) * (grad**2)
         m_hat = m / (1 - beta1**it)
         v_hat = v / (1 - beta2**it)
-        theta -= args.theta_lr * m_hat / (jnp.sqrt(v_hat) + eps)
+        
+        delta = args.theta_lr * m_hat / (jnp.sqrt(v_hat) + eps)
+        theta -= delta
+        
+        # Stats for researchers
+        theta_norm = jnp.linalg.norm(theta)
+        update_ratio = jnp.linalg.norm(delta) / (theta_norm + 1e-9)
+        u, v_params, wa, ba = policy.split_theta(theta)
+        un, vn, wan = jnp.linalg.norm(u), jnp.linalg.norm(v_params), jnp.linalg.norm(wa)
 
         # Logging & Checkpointing
         if it % args.log_every == 0 or it == 1:
-            base_ret = float(rollout_fn(theta[None, :], rollout_key)[0])
+            base_ret_arr, _ = rollout_fn(theta[None, :], rollout_key)
+            base_ret = float(base_ret_arr[0])
+            max_ret = float(jnp.max(cand_returns))
             elapsed = (time.time() - start_time) / 60
             fps = (args.pairs * 2 * args.episodes_per_candidate * args.rollout_steps) / (time.time() - it_start)
-            print(f"Iter {it:3d} | Base Ret: {base_ret:8.2f} | Cand Mean: {jnp.mean(cand_returns):8.2f} | FPS: {fps:6.0f} | {elapsed:4.1f}m", flush=True)
-            logger.log({"iter": it, "base_return": base_ret, "cand_mean": float(jnp.mean(cand_returns)), "fps": fps, "elapsed_min": elapsed})
+            
+            print(f"Iter {it:3d} | Base: {base_ret:7.1f} | Max: {max_ret:7.1f} | Surv: {survival_rate:5.2f} | FPS: {fps:6.0f} | Ratio: {update_ratio:.2e} | {elapsed:4.1f}m", flush=True)
+            
+            logger.log({
+                "iter": it, 
+                "base_return": base_ret, 
+                "max_return": max_ret,
+                "cand_mean": float(jnp.mean(cand_returns)), 
+                "survival_rate": float(survival_rate),
+                "u_norm": float(un),
+                "v_norm": float(vn),
+                "wa_norm": float(wan),
+                "update_ratio": float(update_ratio),
+                "fps": fps, 
+                "elapsed_min": elapsed
+            })
         
         if it % args.checkpoint_every == 0 or it == args.iters:
-            save_checkpoint(os.path.join(run_dir, "checkpoint_latest.pkl"), it, theta, args, {"base_return": base_ret if 'base_ret' in locals() else -1.0})
+            ckpt_name = f"checkpoint_it_{it:04d}.pkl"
+            ckpt_path = os.path.join(run_dir, ckpt_name)
+            save_checkpoint(ckpt_path, it, theta, args, {
+                "base_return": base_ret if 'base_ret' in locals() else -1.0,
+                "max_return": max_ret if 'max_ret' in locals() else -1.0,
+                "survival_rate": float(survival_rate)
+            })
+            print(f"  [Checkpoint] Saved to {ckpt_path}", flush=True)
 
     logger.close()
 

@@ -7,7 +7,7 @@
 #SBATCH --nodelist=cn-x-1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=128
+#SBATCH --cpus-per-task=32
 #SBATCH --gres=gpu:1
 #SBATCH --mem=100G
 #SBATCH --time=24:00:00
@@ -132,8 +132,8 @@ PY
 python humanoid/pertubative_trained_rnn_rl.py \
     --env_candidates "Humanoid-v4" \
     --xml_path humanoid/humanoid.xml \
-    --iters 100 \
-    --pairs 8192 \
+    --iters 500 \
+    --pairs 16384 \
     --sigma 0.03 \
     --theta_lr 0.01 \
     --hidden 1024 \
@@ -141,7 +141,7 @@ python humanoid/pertubative_trained_rnn_rl.py \
     --k_in 50 \
     --leak 0.2 \
     --episodes_per_candidate 2 \
-    --candidate_chunk 2048 \
+    --candidate_chunk 32768 \
     --rollout_steps 500 \
     --log_every 1 \
     --checkpoint_every 1 \
