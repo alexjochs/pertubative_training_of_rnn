@@ -46,13 +46,25 @@ It should use its own environment and dependency path, separate from the root pe
 ## Fixed Runtime Shape
 - Runtime shape is fixed:
   - `pairs=8192`
-  - `candidate_chunk=256`
+  - `candidate_chunk=2048`
 - The training entrypoint performs a one-time warmup/compile for this shape and writes a marker in:
   - `humanoid/jax_compile_cache`
 - JAX persistent compilation cache is enabled via:
   - `--compile_cache_dir` (defaults to `humanoid/jax_compile_cache`)
 
+## Performance & Optimization Notes (H200 Verified)
+- **Throughput**: ~41,000 FPS verified with 16,384 candidates.
+- **Physics Stabilization**:
+  - `mjx.step` is wrapped in `jax.lax.cond` to catch NaNs in `qpos`/`qvel`/`action` before execution.
+  - Solver iterations explicitly clamped to `4` ( Newton) to prevent "silent hangs" on bad states.
+- **Chunking Strategy**: 
+  - `candidate_chunk=2048` provides good occupancy.
+  - `rollout_fn` uses `jax.lax.scan` sequentially over chunks to fit 16k population in memory.
+  - Initial compilation takes ~2-3 minutes; subsequent iterations are <10s execution time.
+
 ## Known Failure Patterns and Fix Direction
+- **Silent Hangs (0 FPS)**:
+  - Caused by physics solver infinite loops on NaN states. Fixed by NaN guards in `env.py`.
 - `NotImplementedError: mjtSolver.mjSOL_PGS`
   - Use XML solver `CG` or `NEWTON`.
 - Backend init weirdness mentioning ROCm while on NVIDIA:
