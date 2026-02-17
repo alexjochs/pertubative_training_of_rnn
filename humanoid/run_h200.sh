@@ -141,7 +141,7 @@ python humanoid/pertubative_trained_rnn_rl.py \
     --k_in 50 \
     --leak 0.2 \
     --episodes_per_candidate 2 \
-    --candidate_chunk 1024 \
+    --candidate_chunk 64 \
     --rollout_steps 500 \
     --log_every 1 \
     --checkpoint_every 1 \
