@@ -28,6 +28,7 @@ from torchvision import transforms
 
 
 
+
 @dataclass
 class ReservoirConfig:
     N: int = 2000          # Reservoir size
@@ -38,6 +39,40 @@ class ReservoirConfig:
     k_in: int = 10         # Sparsity of W0
     w0_std: float = 1.0    # Spectral radius controls
     win_std: float = 0.2   # Input scaling
+
+
+class MNISTDecoder(nn.Module):
+    """
+    Deconvolutional decoder to map 128-d embeddings back to 64x64 images.
+    """
+    def __init__(self, emb_dim: int = 128):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(emb_dim, 1024),
+            nn.ReLU(True),
+            nn.Linear(1024, 2048),
+            nn.ReLU(True),
+            nn.Linear(2048, 512 * 4 * 4) # Output for deconv
+        )
+        
+        self.deconv = nn.Sequential(
+            # [B, 512, 4, 4]
+            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1), # [B, 256, 8, 8]
+            nn.ReLU(True),
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1), # [B, 128, 16, 16]
+            nn.ReLU(True),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),  # [B, 64, 32, 32]
+            nn.ReLU(True),
+            nn.ConvTranspose2d(64, 1, kernel_size=4, stride=2, padding=1),   # [B, 1, 64, 64]
+            nn.Sigmoid()
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # z: [B, D]
+        x = self.fc(z)
+        x = x.view(-1, 512, 4, 4)
+        x = self.deconv(x)
+        return x
 
 
 class PretrainedResNet18Encoder(nn.Module):
@@ -317,14 +352,89 @@ def save_config(args: argparse.Namespace, filepath: str):
         json.dump(vars(args), f, indent=4)
 
 
-def visualize_batch(z_seq: torch.Tensor, decoder: nn.Linear, res: Reservoir, warmup: int, save_path: str):
-    plt.switch_backend('Agg')
-    z_gt = z_seq[0].detach().cpu()
-    T, D = z_gt.shape
+def train_image_decoder(args, z_all: torch.Tensor, x_all: torch.ByteTensor, device: torch.device):
+    """
+    Train (or load) MNSITDecoder to reconstruction images from embeddings.
+    """
+    ckpt_path = os.path.join(args.data_root, "image_decoder_ckpt.pt")
     
+    decoder = MNISTDecoder(emb_dim=args.emb_dim).to(device)
+    
+    if os.path.exists(ckpt_path):
+        print(f"Loading pre-trained image decoder from {ckpt_path}...", flush=True)
+        # Verify if dimensions match? For now assume yes.
+        try:
+            decoder.load_state_dict(torch.load(ckpt_path, map_location=device))
+            decoder.eval()
+            return decoder
+        except Exception as e:
+            print(f"Failed to load checkpoint: {e}. Retraining...", flush=True)
+    
+    print("Training image decoder (z -> x)...", flush=True)
+    decoder.train()
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=1e-3)
+    criterion = nn.BCELoss() # Images are [0,1]
+    
+    # Flatten sequences for training: [N_seq * T, ...]
+    N_seq, T, D = z_all.shape
+    
+    # We can train on a subset or full dataset. 
+    # With 100 epochs on full dataset (200k images), it might take a while.
+    # The user said "~100 epochs".
+    
+    batch_size = 256
+    n_samples = N_seq * T
+    indices = torch.arange(n_samples)
+    
+    # Flatten inputs
+    z_flat = z_all.view(-1, D)
+    x_flat = x_all.view(-1, 1, 64, 64) # ByteTensor
+    
+    epochs = args.dec_train_epochs
+    t0 = time.time()
+    
+    for epoch in range(epochs):
+        perm = torch.randperm(n_samples)
+        total_loss = 0.0
+        batches = 0
+        
+        for i in range(0, n_samples, batch_size):
+            batch_idx = perm[i : i + batch_size]
+            
+            z_batch = z_flat[batch_idx]
+            x_batch = x_flat[batch_idx].to(device).float() / 255.0
+            
+            recon = decoder(z_batch)
+            loss = criterion(recon, x_batch)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            batches += 1
+            
+        avg_loss = total_loss / batches
+        if (epoch + 1) % 10 == 0:
+            dt = time.time() - t0
+            print(f"  Decoder Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.6f} | Elapsed: {dt:.1f}s", flush=True)
+            
+    print(f"Image decoder trained. Saving to {ckpt_path}...", flush=True)
+    torch.save(decoder.state_dict(), ckpt_path)
+    decoder.eval()
+    return decoder
+
+
+def visualize_batch(z_seq: torch.Tensor, decoder: nn.Linear, image_decoder: MNISTDecoder, 
+                    res: Reservoir, warmup: int, save_path: str):
+    plt.switch_backend('Agg')
+    z_gt_seq = z_seq[0].detach().cpu() # [T, D]
+    T, D = z_gt_seq.shape
+    
+    # 1. Run Reservoir to get Pred Z
     h = torch.zeros((1, res.cfg.N), device=res.device)
     z_pred_list = []
-    z_in = z_gt[0:1].to(res.device)
+    z_in = z_gt_seq[0:1].to(res.device)
     
     with torch.no_grad():
         for t in range(T - 1):
@@ -332,26 +442,71 @@ def visualize_batch(z_seq: torch.Tensor, decoder: nn.Linear, res: Reservoir, war
             pred = decoder(h)
             z_pred_list.append(pred.cpu())
             if t < warmup:
-                z_in = z_gt[t+1:t+2].to(res.device)
+                z_in = z_gt_seq[t+1:t+2].to(res.device)
             else:
                 z_in = pred
     
-    z_pred = torch.cat(z_pred_list, dim=0)
-    z_target = z_gt[1:]
+    # z_pred_list has T-1 entries (from t=1 to T-1). t=0 is initial input.
+    # Prepend first frame from GT for nice visualization scaling? 
+    # Or just align t=1..T-1. 
+    # Let's align with GT z_target which typically is t=1..T-1 or t=0..T depending on perspective.
+    # In loop: target is z_seq[:, t+1]. So z_pred aligns with z_gt[1:].
     
-    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-    im0 = axes[0].imshow(z_target.T, aspect='auto', cmap='viridis')
-    axes[0].set_title("Ground Truth Embedding (z_t)")
-    axes[0].set_ylabel("Dimension")
-    plt.colorbar(im0, ax=axes[0])
+    z_pred = torch.cat(z_pred_list, dim=0) # [T-1, D]
+    z_target = z_gt_seq[1:] # [T-1, D]
     
-    im1 = axes[1].imshow(z_pred.T, aspect='auto', cmap='viridis')
-    axes[1].set_title(f"Predicted Embedding (Warmup={warmup})")
+    # 2. Reconstruct Images
+    # We need to run image_decoder on Z
+    # z_target: [T-1, D]
+    # z_pred: [T-1, D]
+    with torch.no_grad():
+        x_target = image_decoder(z_target.to(res.device)).cpu() # [T-1, 1, 64, 64]
+        x_pred = image_decoder(z_pred.to(res.device)).cpu()     # [T-1, 1, 64, 64]
+
+    # 3. Plotting
+    # We want 4 rows: GT Image, GT Z, Pred Image, Pred Z
+    
+    fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
+    
+    # Row 0: GT Images
+    # Concatenate images horizontally
+    # x_target: [Time, 1, H, W] -> [H, Time*W]
+    x_gt_grid = torchvision.utils.make_grid(x_target, nrow=T-1, padding=2, pad_value=0.5)
+    axes[0].imshow(x_gt_grid.permute(1, 2, 0).numpy(), cmap='gray')
+    axes[0].set_title("Ground Truth Reconstructed Images")
+    axes[0].axis('off')
+    
+    # Row 1: GT Z
+    im1 = axes[1].imshow(z_target.T, aspect='auto', cmap='viridis')
+    axes[1].set_title("Ground Truth Embedding (z_t)")
     axes[1].set_ylabel("Dimension")
-    axes[1].set_xlabel("Time Step (t)")
-    axes[1].axvline(x=warmup, color='red', linestyle='--', linewidth=2, label='End of Warmup')
-    axes[1].legend()
     plt.colorbar(im1, ax=axes[1])
+    
+    # Row 2: Pred Images
+    x_pred_grid = torchvision.utils.make_grid(x_pred, nrow=T-1, padding=2, pad_value=0.5)
+    axes[2].imshow(x_pred_grid.permute(1, 2, 0).numpy(), cmap='gray')
+    axes[2].set_title(f"Predicted Reconstructed Images (Warmup={warmup})")
+    axes[2].axis('off')
+
+    # Row 3: Pred Z
+    im3 = axes[3].imshow(z_pred.T, aspect='auto', cmap='viridis')
+    axes[3].set_title(f"Predicted Embedding")
+    axes[3].set_ylabel("Dimension")
+    axes[3].set_xlabel("Time Step (t)")
+    
+    # Add vertical line for warmup on Z plots
+    # Time axis is 0..T-2. Warmup happens at step `warmup`. 
+    # Loop index t goes 0..T-2. t < warmup is forced.
+    # So boundary is at x = warmup - 0.5?
+    # t=warmup-1 is last forced step. t=warmup is first free step.
+    # We plot z_pred which matches z_gt[1:].
+    # Index 0 corresponds to t=1.
+    # Index warmup-1 corresponds to t=warmup. (The first predicted step).
+    # So the line should be at warmup - 0.5 roughly.
+    
+    axes[1].axvline(x=warmup - 0.5, color='red', linestyle='--', linewidth=2)
+    axes[3].axvline(x=warmup - 0.5, color='red', linestyle='--', linewidth=2)
+
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close(fig)
@@ -379,6 +534,7 @@ def precompute_embeddings(args, device):
     encoder.eval()
 
     all_embeddings = []
+    all_images = []
     
     with torch.no_grad():
         for i, batch in enumerate(loader):
@@ -386,20 +542,40 @@ def precompute_embeddings(args, device):
             if args.T < batch.shape[1]:
                 batch = batch[:, :args.T]
             
+            # Store original images as ByteTensor to save RAM (0-255)
+            # Flatten B and T later
+            B, T, C, H, W = batch.shape
+            # batch is uint8 or float? dataset transform says float/255.
+            # But the dataset loader might have applied it.
+            # Convert back to uint8 for storage if it was float.
+            # Ah, the transform in precompute uses transform_image_norm which floats and div 255.
+            # We want to store compact.
+            # Actually, let's just keep them as uint8 before transform? 
+            # But `loader` applies transform.
+            # Let's revert: (batch * 255).to(torch.uint8)
+            imgs_byte = (batch * 255).clamp(0, 255).to(torch.uint8)
+            all_images.append(imgs_byte)
+            
             batch = batch.to(device)
-            B, T, _, H, W = batch.shape
             x = batch.reshape(B * T, 1, H, W)
             z = encoder(x).view(B, T, -1) # [B, T, D]
-            all_embeddings.append(z.cpu()) # Store on CPU to avoid OOM if huge, or GPU if small?
+            all_embeddings.append(z.cpu()) 
             if i % 10 == 0:
                 print(f"  Encoded batch {i}/{len(loader)}", flush=True)
+            
+            if args.limit_data > 0 and i >= args.limit_data - 1:
+                print(f"  Reached limit of {args.limit_data} batches. Stopping.", flush=True)
+                break
 
     # Concatenate all embeddings
     full_embeddings = torch.cat(all_embeddings, dim=0) # [N_total, T, D]
-    elapsed = time.time() - t0
-    print(f"Pre-computation complete. Shape: {full_embeddings.shape}. Time: {elapsed:.2f}s", flush=True)
+    full_images = torch.cat(all_images, dim=0)         # [N_total, T, 1, 64, 64] (uint8)
     
-    return full_embeddings.to(device)
+    elapsed = time.time() - t0
+    print(f"Pre-computation complete. Z: {full_embeddings.shape}, X: {full_images.shape}. Time: {elapsed:.2f}s", flush=True)
+    
+    # Return both. Keep images on CPU until needed (1.6GB). Embeddings to device (small).
+    return full_embeddings.to(device), full_images
 
 
 def main() -> None:
@@ -427,6 +603,8 @@ def main() -> None:
     
     args_parser.add_argument("--dec_lr", type=float, default=0.001, help="Learning rate for readout decoder")
     args_parser.add_argument("--dec_steps", type=int, default=1, help="Decoder training steps per ES iter")
+    args_parser.add_argument("--dec_train_epochs", type=int, default=100, help="Epochs to pre-train image decoder")
+    args_parser.add_argument("--limit_data", type=int, default=0, help="Limit number of batches for pre-computation (0=no limit)")
 
     
     args_parser.add_argument("--leak", type=float, default=0.1, help="Leak rate (alpha)")
@@ -458,8 +636,11 @@ def main() -> None:
     print(f"Device: {device}")
 
     # 1. Pre-compute embeddings
-    dataset_embeddings = precompute_embeddings(args, device)
+    dataset_embeddings, dataset_images = precompute_embeddings(args, device)
     dataset_len = len(dataset_embeddings)
+
+    # 1.5 Train Image Decoder (for visualization)
+    image_decoder = train_image_decoder(args, dataset_embeddings, dataset_images, device)
 
     # 2. Setup Models
     N, D, rnk = args.hidden, args.emb_dim, args.rank
@@ -600,7 +781,7 @@ def main() -> None:
             reservoir.set_adapter_from_theta(theta)
             # Visualize first item of current batch
             viz_path = os.path.join(results_dir, f"viz_iter_{iteration:04d}.png")
-            visualize_batch(z_batch, decoder, reservoir, args.warmup, viz_path)
+            visualize_batch(z_batch, decoder, image_decoder, reservoir, args.warmup, viz_path)
             
             # Simple Reservoir Hidden State Norm Check
             with torch.no_grad():
