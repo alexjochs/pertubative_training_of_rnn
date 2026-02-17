@@ -466,7 +466,7 @@ def visualize_batch(z_seq: torch.Tensor, decoder: nn.Linear, image_decoder: MNIS
     # 3. Plotting
     # We want 4 rows: GT Image, GT Z, Pred Image, Pred Z
     
-    fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=False)
     
     # Row 0: GT Images
     # Concatenate images horizontally
