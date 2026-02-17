@@ -142,12 +142,8 @@ def main():
 
     jit_rollout = jax.jit(rollout_fn)
 
-    print(f"Starting ES loop on {env_id}...", flush=True)
-    start_time = time.time()
-    
-    for it in range(1, args.iters + 1):
-        it_start = time.time()
-        loop_key, eps_key, rollout_key = jax.random.split(loop_key, 3)
+    def train_step(state, rollout_key, eps_key):
+        theta, m, v, it = state
         
         # Sample perturbations
         epsilon = jax.random.normal(eps_key, (args.pairs, policy.theta_dim))
@@ -159,44 +155,66 @@ def main():
         # Gradient Estimation
         fitness = rank_transform(cand_returns)
         w_pos, w_neg = fitness[:args.pairs, None], fitness[args.pairs:, None]
-        grad = -jnp.mean((w_pos - w_neg) * epsilon, axis=0) # Negative for gradient ascent
+        grad = -jnp.mean((w_pos - w_neg) * epsilon, axis=0)
 
         # Adam Update
-        m_old = m
-        m = beta1 * m + (1 - beta1) * grad
-        v = beta2 * v + (1 - beta2) * (grad**2)
-        m_hat = m / (1 - beta1**it)
-        v_hat = v / (1 - beta2**it)
+        m_next = beta1 * m + (1 - beta1) * grad
+        v_next = beta2 * v + (1 - beta2) * (grad**2)
+        m_hat = m_next / (1 - beta1 ** (it + 1))
+        v_hat = v_next / (1 - beta2 ** (it + 1))
         
         delta = args.theta_lr * m_hat / (jnp.sqrt(v_hat) + eps)
-        theta -= delta
+        theta_next = theta - delta
         
-        # Stats for researchers
-        theta_norm = jnp.linalg.norm(theta)
-        update_ratio = jnp.linalg.norm(delta) / (theta_norm + 1e-9)
-        u, v_params, wa, ba = policy.split_theta(theta)
-        un, vn, wan = jnp.linalg.norm(u), jnp.linalg.norm(v_params), jnp.linalg.norm(wa)
+        stats = {
+            "cand_mean": jnp.mean(cand_returns),
+            "max_return": jnp.max(cand_returns),
+            "survival_rate": survival_rate,
+            "grad_norm": jnp.linalg.norm(grad),
+            "update_ratio": jnp.linalg.norm(delta) / (jnp.linalg.norm(theta) + 1e-9)
+        }
+        
+        return (theta_next, m_next, v_next, it + 1), stats
 
-        # Logging & Checkpointing
+    jit_train_step = jax.jit(train_step)
+
+    print(f"Starting ES loop on {env_id}...", flush=True)
+    start_time = time.time()
+    
+    state = (theta, m, v, 0)
+    
+    for it in range(1, args.iters + 1):
+        it_start = time.time()
+        loop_key, eps_key, rollout_key = jax.random.split(loop_key, 3)
+        
+        # Execute fused training step on GPU
+        state, stats = jit_train_step(state, rollout_key, eps_key)
+        theta, m, v, _ = state
+        
+        # Stats for logging
         if it % args.log_every == 0 or it == 1:
-            base_ret_arr, _ = rollout_fn(theta[None, :], rollout_key)
+            # We use the jit_rollout for the base return check
+            base_ret_arr, _ = jit_rollout(theta[None, :], rollout_key)
             base_ret = float(base_ret_arr[0])
-            max_ret = float(jnp.max(cand_returns))
+            
             elapsed = (time.time() - start_time) / 60
             fps = (args.pairs * 2 * args.episodes_per_candidate * args.rollout_steps) / (time.time() - it_start)
             
-            print(f"Iter {it:3d} | Base: {base_ret:7.1f} | Max: {max_ret:7.1f} | Surv: {survival_rate:5.2f} | FPS: {fps:6.0f} | Ratio: {update_ratio:.2e} | {elapsed:4.1f}m", flush=True)
+            u, v_params, wa, ba = policy.split_theta(theta)
+            un, vn, wan = jnp.linalg.norm(u), jnp.linalg.norm(v_params), jnp.linalg.norm(wa)
+
+            print(f"Iter {it:3d} | Base: {base_ret:7.1f} | Max: {float(stats['max_return']):7.1f} | Surv: {float(stats['survival_rate']):5.2f} | FPS: {fps:6.0f} | Ratio: {float(stats['update_ratio']):.2e} | {elapsed:4.1f}m", flush=True)
             
             logger.log({
                 "iter": it, 
                 "base_return": base_ret, 
-                "max_return": max_ret,
-                "cand_mean": float(jnp.mean(cand_returns)), 
-                "survival_rate": float(survival_rate),
+                "max_return": float(stats["max_return"]),
+                "cand_mean": float(stats["cand_mean"]), 
+                "survival_rate": float(stats["survival_rate"]),
                 "u_norm": float(un),
                 "v_norm": float(vn),
                 "wa_norm": float(wan),
-                "update_ratio": float(update_ratio),
+                "update_ratio": float(stats["update_ratio"]),
                 "fps": fps, 
                 "elapsed_min": elapsed
             })

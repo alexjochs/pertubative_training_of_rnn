@@ -111,9 +111,7 @@ class MJXHumanoidEnv:
         data_next = jax.lax.cond(bad_state, unsafe_step, safe_step, data)
 
         # Compute rewards/obs based on data_next
-        x_before = jnp.sum(self.body_mass * data.xipos[:, 0]) / self.total_mass
-        x_after = jnp.sum(self.body_mass * data_next.xipos[:, 0]) / self.total_mass
-        x_vel = (x_after - x_before) / self.dt
+        x_vel = (data_next.subtree_com[0, 0] - data.subtree_com[0, 0]) / self.dt
         
         z = data_next.qpos[2]
         is_healthy = (z > self.spec.healthy_z_min) & (z < self.spec.healthy_z_max)

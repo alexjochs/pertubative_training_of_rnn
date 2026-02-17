@@ -25,9 +25,9 @@ class ReservoirPolicy:
         # Initialize fixed parameters
         key = jax.random.PRNGKey(1234)
         k1, k2 = jax.random.split(key)
-        self.Win = jax.random.normal(k1, (cfg.N, cfg.D)) * cfg.win_std
+        self.Win_T = (jax.random.normal(k1, (cfg.N, cfg.D)) * cfg.win_std).T
         self.b = jnp.zeros(cfg.N)
-        self.W0 = self._make_sparse_w0(cfg.N, cfg.k_in, cfg.w0_std)
+        self.W0_T = self._make_sparse_w0(cfg.N, cfg.k_in, cfg.w0_std).T
 
     @property
     def theta_dim(self) -> int:
@@ -58,9 +58,9 @@ class ReservoirPolicy:
         U, V, Wa, ba = self.split_theta(theta)
         
         # RNN Dynamics
-        rec0 = h @ self.W0.T
+        rec0 = h @ self.W0_T
         low = (h @ V) @ U.T
-        inp = obs @ self.Win.T
+        inp = obs @ self.Win_T
         
         pre = rec0 + low + inp + self.b
         h_next = (1.0 - self.cfg.leak) * h + self.cfg.leak * jnp.tanh(pre)
