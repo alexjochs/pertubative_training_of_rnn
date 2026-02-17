@@ -76,26 +76,45 @@ class MJXHumanoidEnv:
         return jnp.concatenate([position, velocity, com_inertia, com_velocity, actuator_forces, external_contact_forces])
 
     def step(self, data: mjx.Data, action: jnp.ndarray) -> Tuple[mjx.Data, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        # Check for pre-existing NaNs or action NaNs to prevent solver hang
+        bad_state = jnp.any(jnp.logical_not(jnp.isfinite(data.qpos))) | \
+                    jnp.any(jnp.logical_not(jnp.isfinite(data.qvel))) | \
+                    jnp.any(jnp.logical_not(jnp.isfinite(action)))
+        
+        # If state is bad, we must skip mjx.step entirely to avoid GPU hangs
+        # We branch on 'bad_state'
+        
+        def safe_step(d_in):
+            d = d_in.replace(ctrl=action)
+            return jax.lax.fori_loop(0, self.spec.frame_skip, lambda _, x: mjx.step(self.mjx_model, x), d)
+            
+        def unsafe_step(d_in):
+            return d_in # Identity op, no physics
+            
+        # Execute physics only if safe
+        data_next = jax.lax.cond(bad_state, unsafe_step, safe_step, data)
+
+        # Compute rewards/obs based on data_next
         x_before = jnp.sum(self.body_mass * data.xipos[:, 0]) / self.total_mass
-        data = data.replace(ctrl=action)
-        data = jax.lax.fori_loop(0, self.spec.frame_skip, lambda _, d: mjx.step(self.mjx_model, d), data)
-        x_after = jnp.sum(self.body_mass * data.xipos[:, 0]) / self.total_mass
-        
+        x_after = jnp.sum(self.body_mass * data_next.xipos[:, 0]) / self.total_mass
         x_vel = (x_after - x_before) / self.dt
-        z = data.qpos[2]
         
+        z = data_next.qpos[2]
         is_healthy = (z > self.spec.healthy_z_min) & (z < self.spec.healthy_z_max)
-        terminated = self.spec.terminate_when_unhealthy & (~is_healthy)
+        terminated = (self.spec.terminate_when_unhealthy & (~is_healthy)) | bad_state
         
+        # Zero reward if bad_state
         reward = (self.spec.forward_reward_weight * x_vel + 
                   jnp.where(is_healthy, self.spec.healthy_reward, 0.0) -
                   self.spec.ctrl_cost_weight * jnp.sum(jnp.square(action)))
         
         if self.spec.include_contact_cost:
-            contact_cost = self.spec.contact_cost_weight * jnp.minimum(jnp.sum(jnp.square(data.cfrc_ext)), self.spec.contact_cost_max)
-            reward -= contact_cost
-            
-        return data, self.get_obs(data), reward, terminated
+             contact_cost = self.spec.contact_cost_weight * jnp.minimum(jnp.sum(jnp.square(data_next.cfrc_ext)), self.spec.contact_cost_max)
+             reward -= contact_cost
+
+        reward = jnp.where(bad_state, 0.0, reward)
+        
+        return data_next, self.get_obs(data_next), reward, terminated
 
     def reset_one(self, key: jnp.ndarray) -> Tuple[mjx.Data, jnp.ndarray]:
         k1, k2 = jax.random.split(key)
