@@ -132,7 +132,7 @@ PY
 python humanoid/pertubative_trained_rnn_rl.py \
     --env_candidates "Humanoid-v4" \
     --xml_path humanoid/humanoid.xml \
-    --iters 500 \
+    --iters 5000 \
     --pairs 16384 \
     --sigma 0.03 \
     --theta_lr 0.01 \
