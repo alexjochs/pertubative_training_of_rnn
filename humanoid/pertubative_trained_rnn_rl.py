@@ -224,8 +224,8 @@ def main():
             ckpt_path = os.path.join(run_dir, ckpt_name)
             save_checkpoint(ckpt_path, it, theta, args, {
                 "base_return": base_ret if 'base_ret' in locals() else -1.0,
-                "max_return": max_ret if 'max_ret' in locals() else -1.0,
-                "survival_rate": float(survival_rate)
+                "max_return": float(stats["max_return"]),
+                "survival_rate": float(stats["survival_rate"])
             })
             print(f"  [Checkpoint] Saved to {ckpt_path}", flush=True)
 
