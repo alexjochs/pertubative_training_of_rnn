@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=humanoid_mjx_es
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
+#SBATCH --output=search_logs/%x_%j.out
+#SBATCH --error=search_logs/%x_%j.err
 #SBATCH --partition=sy-grp
 #SBATCH --account=sy-grp
 #SBATCH --nodelist=cn-x-1
@@ -32,7 +32,7 @@ done
 
 
 cd "$PROJECT_ROOT"
-mkdir -p "$PROJECT_ROOT/humanoid/logs"
+mkdir -p "$PROJECT_ROOT/humanoid/search_logs"
 
 echo "JobID: $SLURM_JOB_ID"
 echo "Node: $(hostname)"
@@ -129,22 +129,95 @@ print("jax backend:", jax.default_backend())
 print("jax devices:", jax.devices())
 PY
 
+# Default values
+ITERS=5000
+PAIRS=16384
+SIGMA=0.03
+LR=0.01
+HIDDEN=1024
+RANK=32
+K_IN=50
+LEAK=0.2
+EPISODES=2
+CHUNK=32768
+STEPS=500
+CANDIDATES=1024
+
+# Parse arguments
+for i in "$@"; do
+  case $i in
+    --iters=*)
+      ITERS="${i#*=}"
+      ;;
+    --pairs=*)
+      PAIRS="${i#*=}"
+      ;;
+    --sigma=*)
+      SIGMA="${i#*=}"
+      ;;
+    --theta_lr=*)
+      LR="${i#*=}"
+      ;;
+    --hidden=*)
+      HIDDEN="${i#*=}"
+      ;;
+    --rank=*)
+      RANK="${i#*=}"
+      ;;
+    --k_in=*)
+      K_IN="${i#*=}"
+      ;;
+    --leak=*)
+      LEAK="${i#*=}"
+      ;;
+    --episodes=*)
+      EPISODES="${i#*=}"
+      ;;
+    --chunk=*|--candidate_chunk=*)
+      CHUNK="${i#*=}"
+      ;;
+    --steps=*)
+      STEPS="${i#*=}"
+      ;;
+    --candidates=*|--num_candidates=*)
+      CANDIDATES="${i#*=}"
+      ;;
+    *)
+      # Unknown option
+      ;;
+  esac
+done
+
+# Create a descriptive tag for this run
+RUN_TAG="it${ITERS}_p${PAIRS}_h${HIDDEN}_k${K_IN}_cand${CANDIDATES}"
+echo "Run Tag: $RUN_TAG"
+
 python humanoid/pertubative_trained_rnn_rl.py \
     --env_candidates "Humanoid-v4" \
     --xml_path humanoid/humanoid.xml \
-    --iters 5000 \
-    --pairs 16384 \
-    --sigma 0.03 \
-    --theta_lr 0.01 \
-    --hidden 1024 \
-    --rank 32 \
-    --k_in 50 \
-    --leak 0.2 \
-    --episodes_per_candidate 2 \
-    --candidate_chunk 32768 \
-    --rollout_steps 500 \
+    --iters "$ITERS" \
+    --pairs "$PAIRS" \
+    --sigma "$SIGMA" \
+    --theta_lr "$LR" \
+    --hidden "$HIDDEN" \
+    --rank "$RANK" \
+    --k_in "$K_IN" \
+    --leak "$LEAK" \
+    --episodes_per_candidate "$EPISODES" \
+    --candidate_chunk "$CHUNK" \
+    --rollout_steps "$STEPS" \
     --log_every 1 \
     --checkpoint_every 1 \
-    --results_root humanoid/results
+    --num_candidates "$CANDIDATES" \
+    --search_burst_iters 20 \
+    --results_root "humanoid/search_results/$RUN_TAG"
+
+
+# Optionally rename the SLURM output file at the end to include the tag
+if [ -n "${SLURM_JOB_ID:-}" ]; then
+  NEW_LOG="humanoid/search_logs/humanoid_${RUN_TAG}_${SLURM_JOB_ID}.out"
+  echo "Training finished. Copying log to $NEW_LOG"
+  cp "search_logs/humanoid_mjx_es_${SLURM_JOB_ID}.out" "$NEW_LOG" || true
+fi
 
 echo "Humanoid MJX perturbative RL training complete."

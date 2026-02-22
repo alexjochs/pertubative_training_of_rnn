@@ -15,6 +15,40 @@ class ReservoirConfig:
     w0_std: float = 1.0
     win_std: float = 0.15
 
+def sample_hyperparams(key: jax.random.PRNGKey, num_candidates: int) -> dict:
+    # 1024 candidates, sweep leak (log uniform), win_std (log uniform), and w0_std (log uniform)
+    k1, k2, k3 = jax.random.split(key, 3)
+    
+    # leak in [0.01, 1.0] -> log(0.01) to log(1.0)
+    leak = jnp.exp(jax.random.uniform(k1, (num_candidates,), minval=jnp.log(0.01), maxval=jnp.log(1.0)))
+    
+    # win_std in [0.01, 2.0] -> log(0.01) to log(2.0)
+    win_std = jnp.exp(jax.random.uniform(k2, (num_candidates,), minval=jnp.log(0.01), maxval=jnp.log(2.0)))
+    
+    # w0_std in [0.1, 5.0] -> log(0.1) to log(5.0)
+    w0_std = jnp.exp(jax.random.uniform(k3, (num_candidates,), minval=jnp.log(0.1), maxval=jnp.log(5.0)))
+    
+    return {"leak": leak, "win_std": win_std, "w0_std": w0_std}
+
+def generate_reservoir_params(cfg: ReservoirConfig, key: jax.random.PRNGKey, hyperparams: dict) -> dict:
+    leak_arr = hyperparams["leak"]
+    win_std_arr = hyperparams["win_std"]
+    w0_std_arr = hyperparams["w0_std"]
+    num_cand = leak_arr.shape[0]
+    
+    keys = jax.random.split(key, num_cand)
+    
+    def make_res(k, win_std, w0_std):
+        k1, k2 = jax.random.split(k)
+        Win_T = (jax.random.normal(k1, (cfg.N, cfg.D)) * win_std).T
+        W0 = jax.random.normal(k2, (cfg.N, cfg.N)) * (w0_std / (cfg.N**0.5))
+        mask = jax.random.uniform(k2, (cfg.N, cfg.N)) < (cfg.k_in / cfg.N)
+        return Win_T, (W0 * mask).T
+        
+    Win_T_pop, W0_T_pop = jax.vmap(make_res)(keys, win_std_arr, w0_std_arr)
+    return {"leak": leak_arr[:, None], "Win_T": Win_T_pop, "W0_T": W0_T_pop}
+
+
 class ReservoirPolicy:
     def __init__(self, cfg: ReservoirConfig, action_range: Tuple[jnp.ndarray, jnp.ndarray]):
         self.cfg = cfg
@@ -22,27 +56,13 @@ class ReservoirPolicy:
         self.action_scale = 0.5 * (self.high - self.low)
         self.action_bias = 0.5 * (self.high + self.low)
         
-        # Initialize fixed parameters
-        key = jax.random.PRNGKey(1234)
-        k1, k2 = jax.random.split(key)
-        self.Win_T = (jax.random.normal(k1, (cfg.N, cfg.D)) * cfg.win_std).T
+        # We define a single b for all, though we could sweep it too
         self.b = jnp.zeros(cfg.N)
-        self.W0_T = self._make_sparse_w0(cfg.N, cfg.k_in, cfg.w0_std).T
 
     @property
     def theta_dim(self) -> int:
         n, r, a = self.cfg.N, self.cfg.rank, self.cfg.A
         return 2 * n * r + a * n + a
-
-    def _make_sparse_w0(self, N, k_in, w_std):
-        key = jax.random.PRNGKey(1234)
-        scale = w_std / (k_in**0.5)
-        # Simple dense representation for now, as MJX is dense anyway
-        # For true sparsity, we'd use jax.experimental.sparse but dense is faster on GPU for N=1024
-        W0 = jax.random.normal(key, (N, N)) * (w_std / (N**0.5))
-        # Mask to k_in connections per neuron
-        mask = jax.random.uniform(key, (N, N)) < (k_in / N)
-        return W0 * mask
 
     def split_theta(self, theta: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         n, r, a = self.cfg.N, self.cfg.rank, self.cfg.A
@@ -54,16 +74,16 @@ class ReservoirPolicy:
         ba = theta[uv + wa :].reshape((a))
         return U, V, Wa, ba
 
-    def step(self, h: jnp.ndarray, obs: jnp.ndarray, theta: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    def step(self, h: jnp.ndarray, obs: jnp.ndarray, theta: jnp.ndarray, res_params: dict) -> Tuple[jnp.ndarray, jnp.ndarray]:
         U, V, Wa, ba = self.split_theta(theta)
         
         # RNN Dynamics
-        rec0 = h @ self.W0_T
+        rec0 = h @ res_params["W0_T"]
         low = (h @ V) @ U.T
-        inp = obs @ self.Win_T
+        inp = obs @ res_params["Win_T"]
         
         pre = rec0 + low + inp + self.b
-        h_next = (1.0 - self.cfg.leak) * h + self.cfg.leak * jnp.tanh(pre)
+        h_next = (1.0 - res_params["leak"]) * h + res_params["leak"] * jnp.tanh(pre)
         
         # Check for explosion/NaN
         exploded = jnp.any(jnp.logical_not(jnp.isfinite(h_next))) | (jnp.max(jnp.abs(h_next)) > self.cfg.h_clip)
@@ -75,6 +95,9 @@ class ReservoirPolicy:
         
         return h_next, action
 
-    def batched_rollout(self, h, obs, population_theta):
+    def batched_rollout(self, h, obs, population_theta, pop_res_params):
         """Vectorized across population and environments."""
-        return jax.vmap(jax.vmap(self.step, in_axes=(0, 0, None)), in_axes=(0, 0, 0))(h, obs, population_theta)
+        return jax.vmap(
+            jax.vmap(self.step, in_axes=(0, 0, None, None)), 
+            in_axes=(0, 0, 0, 0)
+        )(h, obs, population_theta, pop_res_params)
